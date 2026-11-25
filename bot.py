@@ -15,7 +15,6 @@ import time
 from typing import Any
 import urllib.parse
 
-from aiohttp import web
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
 import httpx
@@ -27,7 +26,6 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     Update,
-    WebAppInfo,
 )
 from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import Forbidden, RetryAfter, TelegramError
@@ -98,14 +96,7 @@ DEFAULT_FIREBASE_CRED_DICT: dict[str, Any] = {
     "universe_domain": "googleapis.com",
 }
 
-WEBAPP_BASE_URL = os.getenv(
-    "WEBAPP_BASE_URL", "https://your-domain.up.railway.app"
-).rstrip("/")
 PORT = int(os.getenv("PORT", "8080"))
-VERIFY_SECRET = os.getenv(
-    "VERIFY_SECRET",
-    hashlib.sha256(BOT_TOKEN.encode("utf-8")).hexdigest(),
-)
 
 UPI_ID = "BHARATPE.8R0I1G1N4X31943@fbpe"
 MERCHANT_NAME = "Merchant"
@@ -115,6 +106,15 @@ DEFAULT_BHARATPE_CONFIG = {
     "token": "1474e270a4c5416e97c57fa146261588",
     "token_alert_sent": False,
 }
+
+MAINTENANCE_MESSAGE = (
+    "🙂 sʏsᴛᴇᴍ ᴜɴᴅᴇʀ ᴍᴀɪɴᴛᴇɴᴀɴᴄᴇ\n"
+    "━━━━━━━━━━━━━━━━━━━━━━\n"
+    "The bot is currently undergoing scheduled maintenance &amp; system upgrades.\n\n"
+    "🔒 All operations are temporarily paused for public users.\n"
+    "👑 Please check our official channels for real-time announcements when services resume!\n"
+    "✨ ᴅᴇᴠᴇʟᴏᴘᴇᴅ ʙʏ: @gbx_support_bot"
+)
 
 IST = timezone(timedelta(hours=5, minutes=30))
 ORDERS_PER_PAGE = 10
@@ -257,9 +257,60 @@ def init_firebase() -> None:
     if cfg_ref.get() is None:
         cfg_ref.set(DEFAULT_BHARATPE_CONFIG)
 
+    maint_ref = firebase_db.reference("config/maintenance_mode")
+    if maint_ref.get() is None:
+        maint_ref.set(False)
+
 
 def fb_ref(path: str) -> firebase_db.Reference:
     return firebase_db.reference(path)
+
+
+def is_maintenance_enabled() -> bool:
+    val = fb_ref("config/maintenance_mode").get()
+    return bool(val)
+
+
+def set_maintenance_enabled(enabled: bool) -> None:
+    fb_ref("config/maintenance_mode").set(bool(enabled))
+
+
+async def guard_maintenance_mode(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> bool:
+    """Returns True if bot is blocked for this user due to Maintenance Mode."""
+    user = update.effective_user
+    if not user or user.id == ADMIN_ID:
+        return False
+    if not is_maintenance_enabled():
+        return False
+
+    if update.callback_query:
+        try:
+            await update.callback_query.answer(
+                "System under maintenance. Please try again later.",
+                show_alert=False,
+            )
+        except TelegramError:
+            pass
+        if update.effective_chat:
+            try:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=MAINTENANCE_MESSAGE,
+                    parse_mode="HTML",
+                )
+            except TelegramError:
+                pass
+    elif update.message:
+        try:
+            await update.message.reply_text(
+                text=MAINTENANCE_MESSAGE,
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+    return True
 
 
 # =====================================================================
@@ -531,6 +582,27 @@ def fetch_sellable_item(slot_id: str, sub_id: str = "") -> dict[str, Any] | None
     }
 
 
+def update_item_price_in_firebase(
+    slot_id: str, sub_id: str, new_price: float
+) -> dict[str, Any]:
+    item = fetch_sellable_item(slot_id, sub_id)
+    if not item:
+        return {"ok": False, "reason": "Selected item or slot not found."}
+
+    old_price = float(item["price"])
+    if sub_id:
+        fb_ref(f"slots/{slot_id}/sub_items/{sub_id}").update({"price": float(new_price)})
+    else:
+        fb_ref(f"slots/{slot_id}").update({"price": float(new_price)})
+
+    return {
+        "ok": True,
+        "display_name": str(item["display_name"]),
+        "old_price": old_price,
+        "new_price": float(new_price),
+    }
+
+
 def _insert_unique_codes_into_firebase(
     slot_id: str, sub_id: str, codes: list[str]
 ) -> tuple[int, int]:
@@ -708,10 +780,6 @@ def direct_add_to_target(
 def withdraw_codes_for_admin(
     slot_id: str, sub_id: str, requested_qty: int | None
 ) -> dict[str, Any]:
-    """
-    Withdraws `requested_qty` (or ALL if requested_qty is None) unsold codes from live stock
-    for admin download. Does NOT create a user order, so it NEVER affects the Leaderboard.
-    """
     now_iso = datetime.now(timezone.utc).isoformat()
     item = fetch_sellable_item(slot_id, sub_id)
     if not item:
@@ -833,25 +901,6 @@ def _allocate_codes_from_firebase(
 # =====================================================================
 
 
-def sign_verify_token(user_id: int) -> str:
-    msg = str(user_id).encode("utf-8")
-    sig = hmac.new(VERIFY_SECRET.encode("utf-8"), msg, hashlib.sha256).hexdigest()[:32]
-    return f"{user_id}.{sig}"
-
-
-def verify_signed_token(token: str) -> int | None:
-    if not token or "." not in token:
-        return None
-    uid_str, sig = token.split(".", 1)
-    if not uid_str.isdigit():
-        return None
-    uid = int(uid_str)
-    expected = sign_verify_token(uid)
-    if hmac.compare_digest(token, expected):
-        return uid
-    return None
-
-
 def ensure_user_record(
     user_id: int,
     username: str | None,
@@ -886,8 +935,6 @@ def ensure_user_record(
         "referred_by": valid_referrer,
         "referral_status": initial_status,
         "referral_reason": "",
-        "device_hash": "",
-        "ip_address": "",
         "created_at": now_iso,
     }
     uref.set(new_user)
@@ -899,8 +946,51 @@ def get_user_row(user_id: int) -> dict[str, Any] | None:
     return data if isinstance(data, dict) else None
 
 
+def claim_referral_reward_if_eligible(user_id: int) -> dict[str, Any]:
+    uref = fb_ref(f"users/{user_id}")
+    user = uref.get()
+    if not isinstance(user, dict):
+        return {"rewarded": False}
+
+    status = str(user.get("referral_status", "none"))
+    referrer_id = user.get("referred_by")
+
+    if status != "pending" or not referrer_id or int(referrer_id) == user_id:
+        return {"rewarded": False}
+
+    ref_uid = int(referrer_id)
+    ref_uref = fb_ref(f"users/{ref_uid}")
+    ref_data = ref_uref.get()
+    if not isinstance(ref_data, dict):
+        uref.update({"referral_status": "none"})
+        return {"rewarded": False}
+
+    referee_earn = round(float(user.get("referral_earnings", 0.0)) + REFERRAL_REWARD_AMOUNT, 2)
+    uref.update(
+        {
+            "referral_earnings": referee_earn,
+            "referral_status": "rewarded",
+            "referral_reason": "Verified channel membership",
+        }
+    )
+
+    new_ref_earn = round(float(ref_data.get("referral_earnings", 0.0)) + REFERRAL_REWARD_AMOUNT, 2)
+    new_ref_cnt = int(ref_data.get("referrals_count", 0)) + 1
+    ref_uref.update(
+        {
+            "referral_earnings": new_ref_earn,
+            "referrals_count": new_ref_cnt,
+        }
+    )
+
+    return {
+        "rewarded": True,
+        "referrer_id": ref_uid,
+        "amount": REFERRAL_REWARD_AMOUNT,
+    }
+
+
 def fetch_all_registered_users() -> list[dict[str, Any]]:
-    """Fetches all users persisted in Firebase RTDB so broadcast & user list survive restarts."""
     users_raw = fb_ref("users").get()
     if not isinstance(users_raw, dict):
         return []
@@ -924,7 +1014,6 @@ def fetch_all_registered_users() -> list[dict[str, Any]]:
 
 
 def lookup_order_by_id(query_id: str) -> dict[str, Any] | None:
-    """Looks up an order by Order ID (ORD...) or Transaction ID (TXN...) in Firebase."""
     clean_id = query_id.strip().upper()
     if not clean_id:
         return None
@@ -944,146 +1033,6 @@ def lookup_order_by_id(query_id: str) -> dict[str, Any] | None:
             ):
                 return odata
     return None
-
-
-def process_device_verification(
-    user_id: int,
-    device_hash: str,
-    ip_address: str,
-    user_agent: str,
-    platform: str,
-    screen_res: str,
-    timezone_str: str,
-) -> dict[str, Any]:
-    now_iso = datetime.now(timezone.utc).isoformat()
-    clean_hash = (device_hash or "").strip()[:128]
-    clean_ip = (ip_address or "unknown").strip()[:64]
-
-    if not clean_hash or len(clean_hash) < 16:
-        return {
-            "ok": False,
-            "rewarded": False,
-            "reason": "Invalid device fingerprint payload.",
-        }
-
-    uref = fb_ref(f"users/{user_id}")
-    user = uref.get()
-    if not isinstance(user, dict):
-        return {
-            "ok": False,
-            "rewarded": False,
-            "reason": "User account not found. Please start the bot first.",
-        }
-
-    status = str(user.get("referral_status", "none"))
-    referrer_id = user.get("referred_by")
-
-    if status == "rewarded":
-        return {
-            "ok": True,
-            "rewarded": False,
-            "already_processed": True,
-            "reason": "Referral verification was already completed earlier.",
-        }
-
-    if status == "rejected":
-        return {
-            "ok": True,
-            "rewarded": False,
-            "already_processed": True,
-            "reason": str(user.get("referral_reason") or "This account is not eligible for referral rewards."),
-        }
-
-    if status != "pending" or not referrer_id or int(referrer_id) == user_id:
-        return {
-            "ok": True,
-            "rewarded": False,
-            "reason": "No pending referral linked to this account.",
-        }
-
-    reg_ref = fb_ref("device_registry")
-    all_devices = reg_ref.get()
-    dup_user = False
-    dup_device = False
-    dup_ip = False
-
-    if isinstance(all_devices, dict):
-        if str(user_id) in all_devices:
-            dup_user = True
-        for entry in all_devices.values():
-            if not isinstance(entry, dict):
-                continue
-            if str(entry.get("device_hash", "")) == clean_hash:
-                dup_device = True
-            if clean_ip and clean_ip != "unknown" and str(entry.get("ip_address", "")) == clean_ip:
-                dup_ip = True
-
-    if dup_user or dup_device or dup_ip:
-        if dup_device:
-            reason = "Duplicate device detected. Another account has already used this device."
-        elif dup_ip:
-            reason = "Duplicate network/IP detected. Referral reward is restricted to one account per device & network."
-        else:
-            reason = "Device already verified previously."
-
-        uref.update(
-            {
-                "referral_status": "rejected",
-                "referral_reason": reason,
-                "device_hash": clean_hash,
-                "ip_address": clean_ip,
-            }
-        )
-        return {
-            "ok": True,
-            "rewarded": False,
-            "referrer_id": int(referrer_id),
-            "reason": reason,
-        }
-
-    reg_ref.child(str(user_id)).set(
-        {
-            "user_id": user_id,
-            "device_hash": clean_hash,
-            "ip_address": clean_ip,
-            "user_agent": user_agent[:256],
-            "platform": platform[:64],
-            "screen_res": screen_res[:32],
-            "timezone": timezone_str[:64],
-            "verified_at": now_iso,
-        }
-    )
-
-    referee_earn = round(float(user.get("referral_earnings", 0.0)) + REFERRAL_REWARD_AMOUNT, 2)
-    uref.update(
-        {
-            "referral_earnings": referee_earn,
-            "referral_status": "rewarded",
-            "referral_reason": "Verified unique device",
-            "device_hash": clean_hash,
-            "ip_address": clean_ip,
-        }
-    )
-
-    ref_uref = fb_ref(f"users/{int(referrer_id)}")
-    ref_data = ref_uref.get()
-    if isinstance(ref_data, dict):
-        new_ref_earn = round(float(ref_data.get("referral_earnings", 0.0)) + REFERRAL_REWARD_AMOUNT, 2)
-        new_ref_cnt = int(ref_data.get("referrals_count", 0)) + 1
-        ref_uref.update(
-            {
-                "referral_earnings": new_ref_earn,
-                "referrals_count": new_ref_cnt,
-            }
-        )
-
-    return {
-        "ok": True,
-        "rewarded": True,
-        "referrer_id": int(referrer_id),
-        "amount": REFERRAL_REWARD_AMOUNT,
-        "reason": "Device verified successfully.",
-    }
 
 
 def create_payment_session(
@@ -1545,7 +1494,6 @@ def fetch_user_orders_page(user_id: int, page: int = 0) -> tuple[list[dict[str, 
 
 
 def fetch_leaderboard(limit: int = 10) -> list[dict[str, Any]]:
-    """Only counts actual customer purchases from `orders`. Admin code downloads never appear here."""
     users_raw = fb_ref("users").get()
     orders_raw = fb_ref("orders").get()
     if not isinstance(orders_raw, dict):
@@ -1810,30 +1758,8 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def build_admin_main_keyboard() -> InlineKeyboardMarkup:
-    """/admin entry button: Inbox Broadcast."""
-    return InlineKeyboardMarkup(
-        [
-            [
-                styled_inline_btn(
-                    text="📨 Inbox Broadcast",
-                    style="primary",
-                    callback_data="adm_menu",
-                )
-            ],
-            [
-                styled_inline_btn(
-                    text="❌ Cancel",
-                    style="danger",
-                    callback_data="back_to_home",
-                )
-            ],
-        ]
-    )
-
-
 def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
-    """3 options inside Inbox Broadcast + Cancel button."""
+    """Broadcast, User List, Check Order ID, Maintenance Mode + Cancel button."""
     return InlineKeyboardMarkup(
         [
             [
@@ -1853,7 +1779,12 @@ def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
                     text="🔍 Check Order ID",
                     style="primary",
                     callback_data="adm_check_order",
-                )
+                ),
+                styled_inline_btn(
+                    text="🛠️ Maintenance Mode",
+                    style="primary",
+                    callback_data="adm_maintenance",
+                ),
             ],
             [
                 styled_inline_btn(
@@ -1863,6 +1794,43 @@ def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
                 )
             ],
         ]
+    )
+
+
+def build_admin_maintenance_toggle_keyboard() -> InlineKeyboardMarkup:
+    active = is_maintenance_enabled()
+    if active:
+        toggle_btn = styled_inline_btn(
+            text="🟢 Maintenance Mode: ON (Tap to Turn OFF)",
+            style="success",
+            callback_data="adm_maint_toggle",
+        )
+    else:
+        toggle_btn = styled_inline_btn(
+            text="🔴 Maintenance Mode: OFF (Tap to Turn ON)",
+            style="danger",
+            callback_data="adm_maint_toggle",
+        )
+    return InlineKeyboardMarkup(
+        [
+            [toggle_btn],
+            [
+                styled_inline_btn(
+                    text="❌ Cancel",
+                    style="danger",
+                    callback_data="adm_menu",
+                )
+            ],
+        ]
+    )
+
+
+def format_admin_maintenance_message() -> str:
+    state_txt = "<b>ON (Green)</b> — Public users are paused." if is_maintenance_enabled() else "<b>OFF (Red)</b> — Bot is live for users."
+    return (
+        "🛠️ <b>Maintenance Mode Control</b>\n\n"
+        f"• <b>Current Status:</b> {state_txt}\n\n"
+        "Tap the toggle button below to switch ON / OFF:"
     )
 
 
@@ -1919,20 +1887,92 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
                     callback_data="ap_dl_codes",
                 ),
                 styled_inline_btn(
-                    text="📊 Check Live Quantity",
+                    text="💲 Change Price Per Unit",
                     style="primary",
-                    callback_data="ap_check_qty",
+                    callback_data="ap_change_price",
                 ),
             ],
             [
                 styled_inline_btn(
+                    text="📊 Check Live Quantity",
+                    style="primary",
+                    callback_data="ap_check_qty",
+                ),
+                styled_inline_btn(
                     text="🏠 Back to Home",
                     style="danger",
                     callback_data="back_to_home",
-                )
+                ),
             ],
         ]
     )
+
+
+def build_admin_price_slots_keyboard() -> InlineKeyboardMarkup:
+    slots = fetch_all_slots()
+    rows: list[list[InlineKeyboardButton]] = []
+    for sl in slots:
+        sid = str(sl["slot_id"])
+        name = str(sl["name"])
+        if sl.get("is_folder"):
+            rows.append(
+                [
+                    styled_inline_btn(
+                        text=f"📁 {name} (Folder)",
+                        style="primary",
+                        callback_data=f"ap_prc_fld:{sid}",
+                    )
+                ]
+            )
+        else:
+            price = float(sl["price"])
+            rows.append(
+                [
+                    styled_inline_btn(
+                        text=f"🎟️ {name} — ₹{price:g}/unit",
+                        style="success",
+                        callback_data=f"ap_prc_itm:{sid}:",
+                    )
+                ]
+            )
+    rows.append(
+        [
+            styled_inline_btn(
+                text="🔙 Back to Admin Panel",
+                style="danger",
+                callback_data="ap_home",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_admin_price_subitems_keyboard(folder_slot: dict[str, Any]) -> InlineKeyboardMarkup:
+    sid = str(folder_slot["slot_id"])
+    rows: list[list[InlineKeyboardButton]] = []
+    for sub in folder_slot.get("sub_items", []):
+        sub_id = str(sub["sub_id"])
+        name = str(sub["name"])
+        price = float(sub["price"])
+        rows.append(
+            [
+                styled_inline_btn(
+                    text=f"🎟️ {name} — ₹{price:g}/unit",
+                    style="success",
+                    callback_data=f"ap_prc_itm:{sid}:{sub_id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            styled_inline_btn(
+                text="⬅️ Back",
+                style="danger",
+                callback_data="ap_change_price",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
 
 
 def build_admin_folder_choice_keyboard() -> InlineKeyboardMarkup:
@@ -2376,22 +2416,6 @@ def build_utr_retry_keyboard(txid: str, attempts_left: int) -> InlineKeyboardMar
     return InlineKeyboardMarkup(rows)
 
 
-def build_device_verify_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    token = sign_verify_token(user_id)
-    verify_url = f"{WEBAPP_BASE_URL}/verify-device?token={token}"
-    return InlineKeyboardMarkup(
-        [
-            [
-                styled_inline_btn(
-                    text="🛡️ Verify Device",
-                    style="success",
-                    web_app=WebAppInfo(url=verify_url),
-                )
-            ]
-        ]
-    )
-
-
 def build_stock_web_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -2579,6 +2603,7 @@ def format_admin_panel_overview() -> str:
         "• <b>➕ New Slot:</b> Create a standalone coupon slot or a Folder containing multiple sub-items.",
         "• <b>⚡ Direct Add Coupon:</b> Append new coupons/links directly into an existing slot or folder item.",
         "• <b>📥 Download Codes:</b> Withdraw &amp; download live codes/links as a <code>.txt</code> file (excluded from Leaderboard).",
+        "• <b>💲 Change Price Per Unit:</b> Update unit price for any slot or folder item.",
     ]
     return "\n".join(lines)
 
@@ -2922,7 +2947,7 @@ def format_refer_message(user_id: int, bot_username: str) -> tuple[str, str]:
     lines = [
         "🤝 <b>Refer &amp; Earn Program</b>",
         "",
-        f"Invite your friends using your personal referral link below. Both you and your friend receive <b>₹{REFERRAL_REWARD_AMOUNT:g}</b> in your Referral Wallet once their device verification is completed.",
+        f"Invite your friends using your personal referral link below. Both you and your friend receive <b>₹{REFERRAL_REWARD_AMOUNT:g}</b> in your Referral Wallet once they join all required channels and verify.",
         "",
         "<b>Your Referral Link</b>",
         f"<code>{html.escape(ref_link)}</code>",
@@ -2931,8 +2956,6 @@ def format_refer_message(user_id: int, bot_username: str) -> tuple[str, str]:
         f"• <b>Reward Per Successful Referral:</b> ₹{REFERRAL_REWARD_AMOUNT:g}",
         f"• <b>Successful Referrals:</b> <b>{stats['referrals_count']}</b>",
         f"• <b>Referral Wallet Earnings:</b> <b>₹{stats['referral_earnings']:g}</b>",
-        "",
-        "<i>Note: Only one account per physical device and network IP is eligible for referral rewards.</i>",
     ]
     return "\n".join(lines), ref_link
 
@@ -3012,26 +3035,6 @@ def clear_all_pending_input_states(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("admin_cmd_state", None)
 
 
-async def send_pending_device_verification_prompt(
-    chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user_row = get_user_row(user_id)
-    if not user_row or user_row.get("referral_status") != "pending":
-        return
-
-    verify_text = (
-        "🛡️ <b>Device Verification Required for Referral Bonus</b>\n\n"
-        f"You joined via a referral link! Complete a quick one-time device check below to unlock your <b>₹{REFERRAL_REWARD_AMOUNT:g}</b> referral wallet bonus.\n\n"
-        "<i>If your device or IP was previously used on another account, the referral bonus will simply be skipped — your bot access will remain completely active.</i>"
-    )
-    await context.bot.send_message(
-        chat_id=chat_id,
-        text=verify_text,
-        reply_markup=build_device_verify_keyboard(user_id),
-        parse_mode="HTML",
-    )
-
-
 async def send_or_edit_home(
     update: Update, context: ContextTypes.DEFAULT_TYPE, from_callback: bool = False
 ) -> None:
@@ -3076,6 +3079,10 @@ async def on_access_granted(
         return
     clear_all_pending_input_states(context)
     ensure_user_record(user.id, user.username, user.first_name)
+
+    async with get_user_lock(user.id):
+        ref_res = claim_referral_reward_if_eligible(user.id)
+
     safe_name = html.escape(user.first_name or "User")
     safe_username = format_username(user.username)
     text = (
@@ -3097,18 +3104,41 @@ async def on_access_granted(
                 reply_markup=build_main_menu_keyboard(),
                 parse_mode="HTML",
             )
-            await send_pending_device_verification_prompt(
-                update.effective_chat.id, user.id, context
-            )
     elif update.message:
         await update.message.reply_text(
             text=text,
             reply_markup=build_main_menu_keyboard(),
             parse_mode="HTML",
         )
-        await send_pending_device_verification_prompt(
-            update.message.chat_id, user.id, context
-        )
+
+    if ref_res.get("rewarded"):
+        reward_amt = float(ref_res.get("amount", REFERRAL_REWARD_AMOUNT))
+        referrer_id = ref_res.get("referrer_id")
+        try:
+            await context.bot.send_message(
+                chat_id=user.id,
+                text=(
+                    f"🎉 <b>Referral Bonus Credited!</b>\n\n"
+                    f"<b>₹{reward_amt:g}</b> has been added to your Referral Wallet for joining via referral and verifying channels."
+                ),
+                parse_mode="HTML",
+            )
+        except TelegramError as exc:
+            logger.warning("Failed to notify referee %s: %s", user.id, exc)
+
+        if referrer_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=referrer_id,
+                    text=(
+                        f"🎉 <b>New Successful Referral!</b>\n\n"
+                        f"User <code>{user.id}</code> ({safe_username}) verified all channels.\n"
+                        f"<b>₹{reward_amt:g}</b> has been credited to your Referral Wallet!"
+                    ),
+                    parse_mode="HTML",
+                )
+            except TelegramError as exc:
+                logger.warning("Failed to notify referrer %s: %s", referrer_id, exc)
 
 
 async def enforce_force_join(
@@ -3163,6 +3193,8 @@ async def enforce_force_join(
 async def start_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await guard_maintenance_mode(update, context):
+        return
     user = update.effective_user
     if not user or not update.message:
         return
@@ -3194,6 +3226,8 @@ async def curl_command(
 
     clear_all_pending_input_states(context)
     if user.id != ADMIN_ID:
+        if await guard_maintenance_mode(update, context):
+            return
         await update.message.reply_text(
             "⛔ <b>Access Denied:</b> This command is restricted to the administrator only.",
             parse_mode="HTML",
@@ -3212,13 +3246,15 @@ async def curl_command(
 async def admin_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Unlocked /admin command with Inbox Broadcast -> (Broadcast, User List, Check Order ID, Cancel)."""
+    """Unlocked /admin command with Broadcast, User List, Check Order ID, Maintenance Mode + Cancel."""
     user = update.effective_user
     if not user or not update.message:
         return
 
     clear_all_pending_input_states(context)
     if user.id != ADMIN_ID:
+        if await guard_maintenance_mode(update, context):
+            return
         await update.message.reply_text(
             "⛔ <b>Access Denied:</b> This command is restricted to the administrator only.",
             parse_mode="HTML",
@@ -3227,7 +3263,7 @@ async def admin_command(
 
     await update.message.reply_text(
         "🛡️ <b>Admin Controls</b>\n\nSelect an action below:",
-        reply_markup=build_admin_main_keyboard(),
+        reply_markup=build_admin_inbox_menu_keyboard(),
         parse_mode="HTML",
     )
 
@@ -3241,6 +3277,8 @@ async def adminpanel_command(
 
     clear_all_pending_input_states(context)
     if user.id != ADMIN_ID:
+        if await guard_maintenance_mode(update, context):
+            return
         await update.message.reply_text(
             "⛔ <b>Access Denied:</b> This command is restricted to the administrator only.",
             parse_mode="HTML",
@@ -3257,6 +3295,8 @@ async def adminpanel_command(
 async def unknown_command_handler(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await guard_maintenance_mode(update, context):
+        return
     if not update.message or not update.effective_user:
         return
     clear_all_pending_input_states(context)
@@ -3847,6 +3887,11 @@ async def run_utr_verification_flow(
 async def verify_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if update.effective_chat and update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if await guard_maintenance_mode(update, context):
+        return
+
     query = update.callback_query
     user = update.effective_user
     if not query or not user:
@@ -3990,6 +4035,8 @@ async def show_leaderboard(update: Update) -> None:
 async def handle_menu_text(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if await guard_maintenance_mode(update, context):
+        return
     if not update.message or not update.effective_user:
         return
     clear_all_pending_input_states(context)
@@ -4062,9 +4109,11 @@ async def handle_inline_callbacks(
 
     data = query.data or ""
 
-    # /admin Inbox Broadcast callbacks (strictly ADMIN_ID only)
+    # /admin callbacks (strictly ADMIN_ID only)
     if data.startswith("adm_"):
         if user.id != ADMIN_ID:
+            if await guard_maintenance_mode(update, context):
+                return
             await query.answer("Access Denied: Administrator only.", show_alert=True)
             return
 
@@ -4072,11 +4121,32 @@ async def handle_inline_callbacks(
             clear_all_pending_input_states(context)
             await query.answer()
             await query.edit_message_text(
-                text=(
-                    "📨 <b>Inbox Broadcast &amp; Order Tools</b>\n\n"
-                    "Choose an option below:"
-                ),
+                text="🛡️ <b>Admin Controls</b>\n\nSelect an action below:",
                 reply_markup=build_admin_inbox_menu_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "adm_maintenance":
+            clear_all_pending_input_states(context)
+            await query.answer()
+            await query.edit_message_text(
+                text=format_admin_maintenance_message(),
+                reply_markup=build_admin_maintenance_toggle_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "adm_maint_toggle":
+            new_state = not is_maintenance_enabled()
+            set_maintenance_enabled(new_state)
+            await query.answer(
+                f"Maintenance Mode {'ON' if new_state else 'OFF'}",
+                show_alert=False,
+            )
+            await query.edit_message_text(
+                text=format_admin_maintenance_message(),
+                reply_markup=build_admin_maintenance_toggle_keyboard(),
                 parse_mode="HTML",
             )
             return
@@ -4145,6 +4215,8 @@ async def handle_inline_callbacks(
     # /adminpanel callbacks (strictly ADMIN_ID only)
     if data.startswith("ap_"):
         if user.id != ADMIN_ID:
+            if await guard_maintenance_mode(update, context):
+                return
             await query.answer("Access Denied: Administrator only.", show_alert=True)
             return
 
@@ -4164,6 +4236,76 @@ async def handle_inline_callbacks(
             await query.edit_message_text(
                 text=format_admin_live_quantity_report(),
                 reply_markup=build_admin_panel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "ap_change_price":
+            clear_all_pending_input_states(context)
+            slots = fetch_all_slots()
+            if not slots:
+                await query.answer("No slots available in inventory.", show_alert=True)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    "💲 <b>Change Price Per Unit</b>\n\n"
+                    "Select a slot or folder below to update its price per unit:"
+                ),
+                reply_markup=build_admin_price_slots_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data.startswith("ap_prc_fld:"):
+            sid = data.split(":", 1)[1]
+            slots = fetch_all_slots()
+            folder_slot = next((s for s in slots if s["slot_id"] == sid and s.get("is_folder")), None)
+            if not folder_slot:
+                await query.answer("Folder not found.", show_alert=True)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    f"📁 <b>Folder: {html.escape(str(folder_slot['name']))}</b>\n\n"
+                    "Select an item inside this folder to change its price per unit:"
+                ),
+                reply_markup=build_admin_price_subitems_keyboard(folder_slot),
+                parse_mode="HTML",
+            )
+            return
+
+        if data.startswith("ap_prc_itm:"):
+            parts = data.split(":", 2)
+            sid = parts[1] if len(parts) > 1 else ""
+            sub_id = parts[2] if len(parts) > 2 else ""
+            item = fetch_sellable_item(sid, sub_id)
+            if not item:
+                await query.answer("Slot item not found.", show_alert=True)
+                return
+            await query.answer()
+            context.user_data["admin_panel_state"] = {
+                "mode": "change_price",
+                "step": "price",
+                "slot_id": sid,
+                "sub_id": sub_id,
+            }
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        styled_inline_btn(
+                            text="❌ Cancel", style="danger", callback_data="ap_home"
+                        )
+                    ]
+                ]
+            )
+            await query.edit_message_text(
+                text=(
+                    f"💲 <b>Change Price: {html.escape(str(item['display_name']))}</b>\n"
+                    f"• <b>Current Price Per Unit:</b> <b>₹{float(item['price']):g}</b>\n\n"
+                    "Enter the <b>new price per unit</b> in INR (e.g., <code>25</code> or <code>49.50</code>):"
+                ),
+                reply_markup=kb,
                 parse_mode="HTML",
             )
             return
@@ -4405,6 +4547,9 @@ async def handle_inline_callbacks(
             await query.answer("Withdrawn all codes!")
             await send_withdrawn_codes_file(update, context, res, from_callback=True)
             return
+
+    if await guard_maintenance_mode(update, context):
+        return
 
     allowed = await enforce_force_join(update, context)
     if not allowed:
@@ -4942,7 +5087,7 @@ async def handle_admin_cmd_inputs(
 async def handle_admin_panel_inputs(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Handles step-by-step inputs for /adminpanel (New Slot / Folder, Direct Add & Download Codes)."""
+    """Handles step-by-step inputs for /adminpanel (New Slot / Folder, Direct Add, Download Codes & Change Price)."""
     user = update.effective_user
     msg = update.message
     if not user or not msg or user.id != ADMIN_ID:
@@ -4963,6 +5108,54 @@ async def handle_admin_panel_inputs(
             ]
         ]
     )
+
+    if mode == "change_price" and step == "price":
+        sid = str(ap_state.get("slot_id", ""))
+        sub_id = str(ap_state.get("sub_id", ""))
+        if not msg.text:
+            await msg.reply_text(
+                "❌ Please enter a valid numeric price per unit in INR (e.g., <code>25</code>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+        cleaned = msg.text.strip().replace("₹", "").replace(",", "").strip()
+        if not re.fullmatch(r"\d+(\.\d{1,2})?", cleaned):
+            await msg.reply_text(
+                "❌ <b>Invalid Price Format</b>\n\nPlease enter numbers only (e.g., <code>25</code> or <code>49.50</code>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+        new_price = round(float(cleaned), 2)
+        if not math.isfinite(new_price) or new_price <= 0:
+            await msg.reply_text(
+                "❌ Price must be greater than ₹0. Please enter a valid price:",
+                reply_markup=cancel_kb,
+            )
+            return True
+
+        async with _INVENTORY_LOCK:
+            res = update_item_price_in_firebase(sid, sub_id, new_price)
+        context.user_data.pop("admin_panel_state", None)
+
+        if not res.get("ok"):
+            await msg.reply_text(
+                f"❌ {html.escape(str(res.get('reason', 'Failed to update price.')))}",
+                reply_markup=build_admin_panel_keyboard(),
+                parse_mode="HTML",
+            )
+            return True
+
+        await msg.reply_text(
+            "✅ <b>Price Per Unit Updated!</b>\n\n"
+            f"• <b>Item:</b> <b>{html.escape(str(res['display_name']))}</b>\n"
+            f"• <b>Previous Price:</b> ₹{float(res['old_price']):g}\n"
+            f"• <b>New Price Per Unit:</b> <b>₹{float(res['new_price']):g}</b>",
+            reply_markup=build_admin_panel_keyboard(),
+            parse_mode="HTML",
+        )
+        return True
 
     if mode == "new_slot":
         if step == "name":
@@ -5267,7 +5460,7 @@ async def handle_free_text_and_docs(
     if user.id == ADMIN_ID and await handle_admin_cmd_inputs(update, context):
         return
 
-    # 2. /adminpanel active wizard (New Slot / Folder, Direct Add, Download Codes)
+    # 2. /adminpanel active wizard (New Slot / Folder, Direct Add, Download Codes & Change Price)
     if user.id == ADMIN_ID and await handle_admin_panel_inputs(update, context):
         return
 
@@ -5296,6 +5489,9 @@ async def handle_free_text_and_docs(
         ):
             await apply_admin_curl_update(update, context, msg.text)
             return
+
+    if await guard_maintenance_mode(update, context):
+        return
 
     # 4. Enforce force-join on all regular user interactions
     allowed = await enforce_force_join(update, context)
@@ -5422,338 +5618,7 @@ async def handle_free_text_and_docs(
     )
 
 
-# =====================================================================
-# Telegram Mini App (WebApp) Device & IP Verification HTTP Server
-# =====================================================================
-
-VERIFY_DEVICE_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Device Verification</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    :root {
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
-      --text: #f8fafc;
-      --muted: #94a3b8;
-      --accent: #22c55e;
-      --warn: #f59e0b;
-    }
-    * { box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-    body {
-      margin: 0;
-      padding: 18px;
-      background: var(--bg);
-      color: var(--text);
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      min-height: 100vh;
-    }
-    .card {
-      width: 100%;
-      max-width: 440px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 20px;
-      box-shadow: 0 12px 30px rgba(0,0,0,0.35);
-    }
-    h2 { margin: 0 0 6px; font-size: 20px; }
-    p.sub { margin: 0 0 16px; color: var(--muted); font-size: 13px; line-height: 1.45; }
-    .grid {
-      background: rgba(15, 23, 42, 0.65);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 12px 14px;
-      margin-bottom: 16px;
-    }
-    .row {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      padding: 7px 0;
-      border-bottom: 1px solid rgba(51, 65, 85, 0.5);
-      font-size: 13px;
-    }
-    .row:last-child { border-bottom: none; }
-    .label { color: var(--muted); }
-    .val { font-weight: 600; text-align: right; word-break: break-all; }
-    button {
-      width: 100%;
-      padding: 13px;
-      border: none;
-      border-radius: 12px;
-      background: var(--accent);
-      color: #052e16;
-      font-weight: 700;
-      font-size: 15px;
-      cursor: pointer;
-    }
-    button:disabled { opacity: 0.6; cursor: not-allowed; }
-    .status {
-      margin-top: 12px;
-      font-size: 13px;
-      text-align: center;
-      color: var(--warn);
-      min-height: 20px;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h2>🛡️ Device Security Verification</h2>
-    <p class="sub">Verifying your device and network details to prevent duplicate referral accounts and credit your ₹2 bonus.</p>
-
-    <div class="grid">
-      <div class="row"><span class="label">Telegram User ID</span><span class="val" id="uid">Loading...</span></div>
-      <div class="row"><span class="label">IP Address</span><span class="val" id="ip">Detecting...</span></div>
-      <div class="row"><span class="label">Platform / OS</span><span class="val" id="platform">Detecting...</span></div>
-      <div class="row"><span class="label">Screen Resolution</span><span class="val" id="screen">Detecting...</span></div>
-      <div class="row"><span class="label">Timezone</span><span class="val" id="tz">Detecting...</span></div>
-      <div class="row"><span class="label">Device ID Hash</span><span class="val" id="hash">Generating...</span></div>
-    </div>
-
-    <button id="verifyBtn" disabled>Complete Device Verification</button>
-    <div class="status" id="statusMsg">Collecting device parameters...</div>
-  </div>
-
-  <script>
-    const tg = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
-    if (tg) {
-      tg.ready();
-      tg.expand();
-    }
-
-    const params = new URLSearchParams(window.location.search);
-    const token = params.get("token") || "";
-    const userId = token.split(".")[0] || "Unknown";
-    document.getElementById("uid").textContent = userId;
-
-    function getCanvasFingerprint() {
-      try {
-        const canvas = document.createElement("canvas");
-        const ctx = canvas.getContext("2d");
-        ctx.textBaseline = "top";
-        ctx.font = "14px Arial";
-        ctx.fillStyle = "#f60";
-        ctx.fillRect(125, 1, 62, 20);
-        ctx.fillStyle = "#069";
-        ctx.fillText("GBX-Device-Verify-2026", 2, 15);
-        return canvas.toDataURL();
-      } catch (e) {
-        return "no-canvas";
-      }
-    }
-
-    function getWebGLRenderer() {
-      try {
-        const canvas = document.createElement("canvas");
-        const gl = canvas.getContext("webgl") || canvas.getContext("experimental-webgl");
-        if (!gl) return "no-webgl";
-        const ext = gl.getExtension("WEBGL_debug_renderer_info");
-        return ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : "webgl-std";
-      } catch (e) {
-        return "no-webgl";
-      }
-    }
-
-    async function sha256Hex(str) {
-      const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
-      return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
-    }
-
-    let payloadData = null;
-
-    async function initDiagnostics() {
-      const platform = navigator.platform || "Unknown";
-      const ua = navigator.userAgent || "Unknown";
-      const screenRes = `${window.screen.width}x${window.screen.height}x${window.screen.colorDepth}`;
-      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || "Unknown";
-      const lang = navigator.language || "en";
-      const cores = navigator.hardwareConcurrency || 0;
-      const mem = navigator.deviceMemory || 0;
-      const canvasFp = getCanvasFingerprint();
-      const gpu = getWebGLRenderer();
-
-      const rawFingerprint = [platform, screenRes, tz, lang, cores, mem, gpu, canvasFp].join("|");
-      const deviceHash = await sha256Hex(rawFingerprint);
-
-      let clientIp = "__SERVER_IP__";
-      try {
-        const ipRes = await fetch("https://api.ipify.org?format=json");
-        if (ipRes.ok) {
-          const ipJson = await ipRes.json();
-          if (ipJson.ip) clientIp = ipJson.ip;
-        }
-      } catch (e) {}
-
-      document.getElementById("ip").textContent = clientIp;
-      document.getElementById("platform").textContent = platform;
-      document.getElementById("screen").textContent = screenRes;
-      document.getElementById("tz").textContent = tz;
-      document.getElementById("hash").textContent = deviceHash.slice(0, 16) + "...";
-
-      payloadData = {
-        token,
-        device_hash: deviceHash,
-        ip_address: clientIp,
-        user_agent: ua,
-        platform,
-        screen_res: screenRes,
-        timezone: tz
-      };
-
-      const btn = document.getElementById("verifyBtn");
-      btn.disabled = false;
-      document.getElementById("statusMsg").textContent = "Ready. Tap above to verify your device.";
-    }
-
-    document.getElementById("verifyBtn").addEventListener("click", async () => {
-      if (!payloadData) return;
-      const btn = document.getElementById("verifyBtn");
-      const statusEl = document.getElementById("statusMsg");
-      btn.disabled = true;
-      statusEl.textContent = "Verifying with bot server...";
-
-      try {
-        const res = await fetch("/api/verify-device", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payloadData)
-        });
-        const data = await res.json();
-        statusEl.textContent = data.message || "Verification completed.";
-        setTimeout(() => {
-          if (tg) tg.close();
-        }, 900);
-      } catch (err) {
-        statusEl.textContent = "Network error. Please retry.";
-        btn.disabled = false;
-      }
-    });
-
-    initDiagnostics();
-  </script>
-</body>
-</html>
-"""
-
-
-def extract_client_ip(request: web.Request) -> str:
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("X-Real-IP", "")
-    if real_ip:
-        return real_ip.strip()
-    return request.remote or "unknown"
-
-
-async def handle_verify_page(request: web.Request) -> web.Response:
-    token = request.query.get("token", "")
-    uid = verify_signed_token(token)
-    if not uid:
-        return web.Response(
-            text="Invalid or expired verification link.",
-            status=403,
-            content_type="text/plain",
-        )
-    server_ip = html.escape(extract_client_ip(request))
-    page_html = VERIFY_DEVICE_HTML.replace("__SERVER_IP__", server_ip)
-    return web.Response(text=page_html, content_type="text/html")
-
-
-async def handle_verify_api(request: web.Request) -> web.Response:
-    bot_app: Application = request.app["bot_app"]
-    try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        return web.json_response(
-            {"ok": False, "message": "Invalid request payload."}, status=400
-        )
-
-    token = str(body.get("token", ""))
-    user_id = verify_signed_token(token)
-    if not user_id:
-        return web.json_response(
-            {"ok": False, "message": "Unauthorized verification token."}, status=403
-        )
-
-    server_ip = extract_client_ip(request)
-    client_ip = str(body.get("ip_address", "")).strip()
-    final_ip = server_ip if server_ip and server_ip != "unknown" else client_ip
-
-    async with get_user_lock(user_id):
-        result = process_device_verification(
-            user_id=user_id,
-            device_hash=str(body.get("device_hash", "")),
-            ip_address=final_ip,
-            user_agent=str(body.get("user_agent", "")),
-            platform=str(body.get("platform", "")),
-            screen_res=str(body.get("screen_res", "")),
-            timezone_str=str(body.get("timezone", "")),
-        )
-
-    if result.get("rewarded"):
-        referrer_id = result.get("referrer_id")
-        try:
-            await bot_app.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    f"✅ <b>Device Verified Successfully!</b>\n\n"
-                    f"<b>₹{REFERRAL_REWARD_AMOUNT:g}</b> referral signup bonus has been credited to your Referral Wallet."
-                ),
-                parse_mode="HTML",
-            )
-        except TelegramError as exc:
-            logger.warning("Failed to notify referee %s: %s", user_id, exc)
-
-        if referrer_id:
-            try:
-                await bot_app.bot.send_message(
-                    chat_id=referrer_id,
-                    text=(
-                        f"🎉 <b>New Successful Referral!</b>\n\n"
-                        f"User <code>{user_id}</code> completed device verification.\n"
-                        f"<b>₹{REFERRAL_REWARD_AMOUNT:g}</b> has been credited to your Referral Wallet!"
-                    ),
-                    parse_mode="HTML",
-                )
-            except TelegramError as exc:
-                logger.warning("Failed to notify referrer %s: %s", referrer_id, exc)
-
-        return web.json_response(
-            {
-                "ok": True,
-                "rewarded": True,
-                "message": f"Verified! ₹{REFERRAL_REWARD_AMOUNT:g} credited to both wallets.",
-            }
-        )
-
-    reason = result.get("reason", "Referral reward is not applicable.")
-    if not result.get("already_processed"):
-        try:
-            await bot_app.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "⚠️ <b>Referral Reward Not Applicable</b>\n\n"
-                    f"{html.escape(reason)}\n\n"
-                    "You still have full access to use all bot features."
-                ),
-                parse_mode="HTML",
-            )
-        except TelegramError as exc:
-            logger.warning("Failed to notify rejected user %s: %s", user_id, exc)
-
-    return web.json_response({"ok": True, "rewarded": False, "message": reason})
-
-
-async def run_bot_and_webapp() -> None:
+async def run_bot() -> None:
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
         raise RuntimeError("Please set BOT_TOKEN in environment variables or code.")
 
@@ -5782,7 +5647,7 @@ async def run_bot_and_webapp() -> None:
         [
             BotCommand("start", "Start the bot"),
             BotCommand("curl", "Update BharatPe cURL / session token (Admin)"),
-            BotCommand("admin", "Inbox Broadcast, User List & Order Check (Admin)"),
+            BotCommand("admin", "Broadcast, User List, Order Check & Maintenance (Admin)"),
             BotCommand("adminpanel", "Manage coupon slots, folders & stock (Admin)"),
         ]
     )
@@ -5802,7 +5667,9 @@ async def run_bot_and_webapp() -> None:
             handle_inline_callbacks,
             pattern=(
                 r"^(adm_menu|adm_broadcast|adm_users:\d+|adm_check_order|"
+                r"adm_maintenance|adm_maint_toggle|"
                 r"ap_home|ap_new_slot|ap_folder_yes|ap_folder_no|ap_direct_add|ap_check_qty|"
+                r"ap_change_price|ap_prc_fld:[a-zA-Z0-9_]+|ap_prc_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dir_fld:[a-zA-Z0-9_]+|ap_dir_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dl_codes|ap_dl_fld:[a-zA-Z0-9_]+|ap_dl_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dl_all:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
@@ -5831,17 +5698,6 @@ async def run_bot_and_webapp() -> None:
         app.job_queue.run_repeating(token_health_check, interval=3600, first=15)
         restore_pending_expiry_jobs(app.job_queue)
 
-    web_app = web.Application()
-    web_app["bot_app"] = app
-    web_app.router.add_get("/verify-device", handle_verify_page)
-    web_app.router.add_post("/api/verify-device", handle_verify_api)
-
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    logger.info("WebApp verification server listening on 0.0.0.0:%s", PORT)
-
     await app.initialize()
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
@@ -5854,11 +5710,10 @@ async def run_bot_and_webapp() -> None:
         await app.updater.stop()
         await app.stop()
         await app.shutdown()
-        await runner.cleanup()
 
 
 def main() -> None:
-    asyncio.run(run_bot_and_webapp())
+    asyncio.run(run_bot())
 
 
 if __name__ == "__main__":
