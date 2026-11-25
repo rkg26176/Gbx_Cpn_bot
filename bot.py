@@ -434,7 +434,16 @@ async def verify_bharatpe_payment(utr: str, expected_amount: float) -> dict[str,
     return {"ok": False, "reason": "NOT_FOUND"}
 
 
+def is_within_bharatpe_check_window() -> bool:
+    """Allows token check only between 06:00 and 24:00 IST (skips 00:00 to 06:00 IST)."""
+    now_ist = datetime.now(IST)
+    return 6 <= now_ist.hour < 24
+
+
 async def token_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_within_bharatpe_check_window():
+        return
+
     cfg = load_bharatpe_config()
     status_code, _ = await fetch_bharatpe_transactions(page_size=1)
 
@@ -580,6 +589,45 @@ def fetch_sellable_item(slot_id: str, sub_id: str = "") -> dict[str, Any] | None
         "price": float(slot.get("price", 0.0)),
         "stock": stk,
     }
+
+
+def delete_slot_or_subitem_in_firebase(slot_id: str, sub_id: str = "") -> dict[str, Any]:
+    """Deletes a standalone slot, a sub-item inside a folder, or a whole folder + its codes."""
+    slot = fb_ref(f"slots/{slot_id}").get()
+    if not isinstance(slot, dict):
+        return {"ok": False, "reason": "Slot not found."}
+
+    codes_ref = fb_ref("coupon_codes")
+    all_codes = codes_ref.get()
+    code_deletes: dict[str, Any] = {}
+
+    if sub_id:
+        sub = fb_ref(f"slots/{slot_id}/sub_items/{sub_id}").get()
+        if not isinstance(sub, dict):
+            return {"ok": False, "reason": "Sub-item not found."}
+        deleted_name = f"{slot.get('name', '')} / {sub.get('name', '')}"
+        if isinstance(all_codes, dict):
+            for ckey, cdata in all_codes.items():
+                if (
+                    isinstance(cdata, dict)
+                    and str(cdata.get("slot_id") or "") == slot_id
+                    and str(cdata.get("sub_id") or "") == sub_id
+                ):
+                    code_deletes[ckey] = None
+        if code_deletes:
+            codes_ref.update(code_deletes)
+        fb_ref(f"slots/{slot_id}/sub_items/{sub_id}").delete()
+        return {"ok": True, "deleted_name": deleted_name}
+
+    deleted_name = str(slot.get("name", "Slot"))
+    if isinstance(all_codes, dict):
+        for ckey, cdata in all_codes.items():
+            if isinstance(cdata, dict) and str(cdata.get("slot_id") or "") == slot_id:
+                code_deletes[ckey] = None
+    if code_deletes:
+        codes_ref.update(code_deletes)
+    fb_ref(f"slots/{slot_id}").delete()
+    return {"ok": True, "deleted_name": deleted_name}
 
 
 def update_item_price_in_firebase(
@@ -1894,16 +1942,126 @@ def build_admin_panel_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 styled_inline_btn(
+                    text="🗑️ Delete Slots",
+                    style="danger",
+                    callback_data="ap_del_slots",
+                ),
+                styled_inline_btn(
                     text="📊 Check Live Quantity",
                     style="primary",
                     callback_data="ap_check_qty",
                 ),
+            ],
+            [
                 styled_inline_btn(
                     text="🏠 Back to Home",
                     style="danger",
                     callback_data="back_to_home",
-                ),
+                )
             ],
+        ]
+    )
+
+
+def build_admin_delete_slots_keyboard() -> InlineKeyboardMarkup:
+    slots = fetch_all_slots()
+    rows: list[list[InlineKeyboardButton]] = []
+    for sl in slots:
+        sid = str(sl["slot_id"])
+        name = str(sl["name"])
+        stk = int(sl["stock"])
+        if sl.get("is_folder"):
+            rows.append(
+                [
+                    styled_inline_btn(
+                        text=f"📁 {name} (Folder • {stk} total)",
+                        style="primary",
+                        callback_data=f"ap_del_fld:{sid}",
+                    )
+                ]
+            )
+        else:
+            price = float(sl["price"])
+            rows.append(
+                [
+                    styled_inline_btn(
+                        text=f"🎟️ {name} — ₹{price:g} (Qty: {stk})",
+                        style="danger",
+                        callback_data=f"ap_del_ask:{sid}:",
+                    )
+                ]
+            )
+    rows.append(
+        [
+            styled_inline_btn(
+                text="🔙 Back to Admin Panel",
+                style="primary",
+                callback_data="ap_home",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_admin_delete_subitems_keyboard(folder_slot: dict[str, Any]) -> InlineKeyboardMarkup:
+    sid = str(folder_slot["slot_id"])
+    rows: list[list[InlineKeyboardButton]] = []
+    for sub in folder_slot.get("sub_items", []):
+        sub_id = str(sub["sub_id"])
+        name = str(sub["name"])
+        price = float(sub["price"])
+        stk = int(sub["stock"])
+        rows.append(
+            [
+                styled_inline_btn(
+                    text=f"🎟️ {name} — ₹{price:g} (Qty: {stk})",
+                    style="danger",
+                    callback_data=f"ap_del_ask:{sid}:{sub_id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            styled_inline_btn(
+                text=f"🗑️ Delete Entire Folder ({stk_total})",
+                style="danger",
+                callback_data=f"ap_del_ask:{sid}:ALL",
+            )
+            if (stk_total := int(folder_slot.get("stock", 0))) >= 0
+            else styled_inline_btn(
+                text="🗑️ Delete Entire Folder",
+                style="danger",
+                callback_data=f"ap_del_ask:{sid}:ALL",
+            )
+        ]
+    )
+    rows.append(
+        [
+            styled_inline_btn(
+                text="⬅️ Back",
+                style="primary",
+                callback_data="ap_del_slots",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def build_admin_delete_confirm_keyboard(sid: str, sub_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                styled_inline_btn(
+                    text="✅ Confirm Delete",
+                    style="danger",
+                    callback_data=f"ap_del_yes:{sid}:{sub_id}",
+                ),
+                styled_inline_btn(
+                    text="❌ Cancel",
+                    style="primary",
+                    callback_data="ap_del_slots",
+                ),
+            ]
         ]
     )
 
@@ -2604,6 +2762,7 @@ def format_admin_panel_overview() -> str:
         "• <b>⚡ Direct Add Coupon:</b> Append new coupons/links directly into an existing slot or folder item.",
         "• <b>📥 Download Codes:</b> Withdraw &amp; download live codes/links as a <code>.txt</code> file (excluded from Leaderboard).",
         "• <b>💲 Change Price Per Unit:</b> Update unit price for any slot or folder item.",
+        "• <b>🗑️ Delete Slots:</b> Delete a slot, folder item, or entire folder from Firebase.",
     ]
     return "\n".join(lines)
 
@@ -4240,6 +4399,95 @@ async def handle_inline_callbacks(
             )
             return
 
+        if data == "ap_del_slots":
+            clear_all_pending_input_states(context)
+            slots = fetch_all_slots()
+            if not slots:
+                await query.answer("No slots available to delete.", show_alert=True)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    "🗑️ <b>Delete Slots</b>\n\n"
+                    "Select a slot or folder below to delete:"
+                ),
+                reply_markup=build_admin_delete_slots_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data.startswith("ap_del_fld:"):
+            sid = data.split(":", 1)[1]
+            slots = fetch_all_slots()
+            folder_slot = next((s for s in slots if s["slot_id"] == sid and s.get("is_folder")), None)
+            if not folder_slot:
+                await query.answer("Folder not found.", show_alert=True)
+                return
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    f"📁 <b>Folder: {html.escape(str(folder_slot['name']))}</b>\n\n"
+                    "Select an item inside this folder or delete the entire folder:"
+                ),
+                reply_markup=build_admin_delete_subitems_keyboard(folder_slot),
+                parse_mode="HTML",
+            )
+            return
+
+        if data.startswith("ap_del_ask:"):
+            parts = data.split(":", 2)
+            sid = parts[1] if len(parts) > 1 else ""
+            sub_id = parts[2] if len(parts) > 2 else ""
+            if sub_id == "ALL":
+                slots = fetch_all_slots()
+                folder_slot = next((s for s in slots if s["slot_id"] == sid and s.get("is_folder")), None)
+                if not folder_slot:
+                    await query.answer("Folder not found.", show_alert=True)
+                    return
+                label = f"Folder: {folder_slot['name']} (Total Qty: {int(folder_slot['stock'])})"
+            else:
+                item = fetch_sellable_item(sid, sub_id)
+                if not item:
+                    await query.answer("Item not found.", show_alert=True)
+                    return
+                label = f"{item['display_name']} (₹{float(item['price']):g} | Qty: {int(item['stock'])})"
+
+            await query.answer()
+            await query.edit_message_text(
+                text=(
+                    "⚠️ <b>Confirm Deletion</b>\n\n"
+                    f"Are you sure you want to delete <b>{html.escape(label)}</b>?\n"
+                    "<i>This will remove the slot and its unsold codes from Firebase.</i>"
+                ),
+                reply_markup=build_admin_delete_confirm_keyboard(sid, sub_id),
+                parse_mode="HTML",
+            )
+            return
+
+        if data.startswith("ap_del_yes:"):
+            parts = data.split(":", 2)
+            sid = parts[1] if len(parts) > 1 else ""
+            sub_id = parts[2] if len(parts) > 2 else ""
+            target_sub = "" if sub_id == "ALL" else sub_id
+
+            async with _INVENTORY_LOCK:
+                res = delete_slot_or_subitem_in_firebase(sid, target_sub)
+
+            if not res.get("ok"):
+                await query.answer(str(res.get("reason", "Delete failed.")), show_alert=True)
+                return
+
+            await query.answer("Deleted!")
+            await query.edit_message_text(
+                text=(
+                    "🗑️ <b>Deleted Successfully!</b>\n\n"
+                    f"• <b>Removed:</b> <b>{html.escape(str(res['deleted_name']))}</b>"
+                ),
+                reply_markup=build_admin_panel_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
         if data == "ap_change_price":
             clear_all_pending_input_states(context)
             slots = fetch_all_slots()
@@ -5087,7 +5335,7 @@ async def handle_admin_cmd_inputs(
 async def handle_admin_panel_inputs(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Handles step-by-step inputs for /adminpanel (New Slot / Folder, Direct Add, Download Codes & Change Price)."""
+    """Handles step-by-step inputs for /adminpanel (New Slot / Folder, Direct Add & Download Codes)."""
     user = update.effective_user
     msg = update.message
     if not user or not msg or user.id != ADMIN_ID:
@@ -5670,6 +5918,8 @@ async def run_bot() -> None:
                 r"adm_maintenance|adm_maint_toggle|"
                 r"ap_home|ap_new_slot|ap_folder_yes|ap_folder_no|ap_direct_add|ap_check_qty|"
                 r"ap_change_price|ap_prc_fld:[a-zA-Z0-9_]+|ap_prc_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
+                r"ap_del_slots|ap_del_fld:[a-zA-Z0-9_]+|ap_del_ask:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
+                r"ap_del_yes:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dir_fld:[a-zA-Z0-9_]+|ap_dir_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dl_codes|ap_dl_fld:[a-zA-Z0-9_]+|ap_dl_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_dl_all:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
@@ -5695,7 +5945,7 @@ async def run_bot() -> None:
     )
 
     if app.job_queue:
-        app.job_queue.run_repeating(token_health_check, interval=3600, first=15)
+        app.job_queue.run_repeating(token_health_check, interval=10800, first=15)
         restore_pending_expiry_jobs(app.job_queue)
 
     await app.initialize()
