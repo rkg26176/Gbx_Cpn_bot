@@ -29,7 +29,7 @@ from telegram import (
     Update,
     WebAppInfo,
 )
-from telegram.constants import ChatMemberStatus
+from telegram.constants import ChatMemberStatus, ChatType
 from telegram.error import Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
@@ -4052,6 +4052,9 @@ async def handle_menu_text(
 async def handle_inline_callbacks(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
+    if update.effective_chat and update.effective_chat.type != ChatType.PRIVATE:
+        return
+
     query = update.callback_query
     user = update.effective_user
     if not query or not user:
@@ -5773,6 +5776,7 @@ async def run_bot_and_webapp() -> None:
         s.replace("(", "\\(").replace(")", "\\)") for s in menu_texts
     )
     menu_filter = filters.TEXT & filters.Regex(f"^({escaped_menu})$")
+    private_only = filters.ChatType.PRIVATE
 
     await app.bot.set_my_commands(
         [
@@ -5783,16 +5787,16 @@ async def run_bot_and_webapp() -> None:
         ]
     )
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("curl", curl_command))
-    app.add_handler(CommandHandler("admin", admin_command))
-    app.add_handler(CommandHandler("adminpanel", adminpanel_command))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_command_handler))
+    app.add_handler(CommandHandler("start", start_command, filters=private_only))
+    app.add_handler(CommandHandler("curl", curl_command, filters=private_only))
+    app.add_handler(CommandHandler("admin", admin_command, filters=private_only))
+    app.add_handler(CommandHandler("adminpanel", adminpanel_command, filters=private_only))
+    app.add_handler(MessageHandler(private_only & filters.COMMAND, unknown_command_handler))
 
     app.add_handler(
         CallbackQueryHandler(verify_callback, pattern=r"^verify_joins$")
     )
-    app.add_handler(MessageHandler(menu_filter, handle_menu_text))
+    app.add_handler(MessageHandler(private_only & menu_filter, handle_menu_text))
     app.add_handler(
         CallbackQueryHandler(
             handle_inline_callbacks,
@@ -5818,7 +5822,7 @@ async def run_bot_and_webapp() -> None:
 
     app.add_handler(
         MessageHandler(
-            ~filters.COMMAND & ~menu_filter,
+            private_only & ~filters.COMMAND & ~menu_filter,
             handle_free_text_and_docs,
         )
     )
