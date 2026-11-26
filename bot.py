@@ -1,3 +1,4 @@
+import ast
 import asyncio
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -208,21 +209,47 @@ def format_qty_expression(quantity: int) -> str:
     return f"1 * {quantity}"
 
 
-def is_valid_json_item(value: str) -> bool:
-    s = value.strip()
+def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
+    """Parses standard JSON (double-quoted) OR Python-style dict/list (single-quoted).
+    Returns (is_valid, parsed_obj, is_strict_json).
+    """
+    s = raw_block.strip()
     if len(s) < 2:
-        return False
-    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-        try:
-            parsed = json.loads(s)
-            return isinstance(parsed, (dict, list))
-        except (ValueError, TypeError):
-            return False
-    return False
+        return False, None, False
+    if not ((s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))):
+        return False, None, False
+    try:
+        parsed = json.loads(s)
+        if isinstance(parsed, (dict, list)):
+            return True, parsed, True
+    except (ValueError, TypeError):
+        pass
+    try:
+        parsed_ast = ast.literal_eval(s)
+        if isinstance(parsed_ast, (dict, list)):
+            return True, parsed_ast, False
+    except (ValueError, SyntaxError, TypeError):
+        pass
+    return False, None, False
+
+
+def is_valid_json_item(value: str) -> bool:
+    ok, _, _ = _parse_structured_object(value)
+    return ok
+
+
+def _format_structured_block(raw_block: str, parsed_obj: Any, is_strict_json: bool) -> str:
+    """Preserves original clean formatting (including single-quoted or double-quoted JSON blocks)."""
+    s = raw_block.strip()
+    if "\n" in s:
+        return s
+    if is_strict_json:
+        return json.dumps(parsed_obj, ensure_ascii=False, separators=(",", ":"))
+    return s
 
 
 def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
-    """Extracts single-line or multi-line JSON objects/arrays accurately without splitting keys."""
+    """Extracts single-line or multi-line JSON/dict objects & arrays (supports both ' and \")."""
     extracted: list[str] = []
     remaining_chars: list[str] = []
     n = len(text)
@@ -234,7 +261,7 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
             open_ch = ch
             close_ch = "}" if ch == "{" else "]"
             depth = 0
-            in_str = False
+            quote_char: str | None = None
             escape = False
             j = i
             found_end = -1
@@ -244,12 +271,15 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
                 if escape:
                     escape = False
                 elif c == "\\":
-                    if in_str:
+                    if quote_char is not None:
                         escape = True
-                elif c == '"':
-                    in_str = not in_str
-                elif not in_str:
-                    if c == open_ch:
+                elif quote_char is not None:
+                    if c == quote_char:
+                        quote_char = None
+                else:
+                    if c in ('"', "'"):
+                        quote_char = c
+                    elif c == open_ch:
                         depth += 1
                     elif c == close_ch:
                         depth -= 1
@@ -260,34 +290,27 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
 
             if found_end != -1:
                 candidate = text[i : found_end + 1].strip()
-                try:
-                    parsed = json.loads(candidate)
-                    if isinstance(parsed, list):
-                        # If it's a top-level list of dicts/strings/lists, unpack elements
-                        if i == 0 and found_end == n - 1:
-                            for elem in parsed:
-                                if isinstance(elem, (dict, list)):
+                ok, parsed, is_strict_json = _parse_structured_object(candidate)
+                if ok:
+                    if isinstance(parsed, list) and i == 0 and found_end == n - 1:
+                        for elem in parsed:
+                            if isinstance(elem, (dict, list)):
+                                if is_strict_json:
                                     extracted.append(
                                         json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
                                     )
                                 else:
-                                    s_el = str(elem).strip()
-                                    if s_el:
-                                        extracted.append(s_el)
-                        else:
-                            extracted.append(
-                                json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-                            )
-                        i = found_end + 1
-                        continue
-                    elif isinstance(parsed, dict):
+                                    extracted.append(repr(elem))
+                            else:
+                                s_el = str(elem).strip()
+                                if s_el:
+                                    extracted.append(s_el)
+                    else:
                         extracted.append(
-                            json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                            _format_structured_block(candidate, parsed, is_strict_json)
                         )
-                        i = found_end + 1
-                        continue
-                except (ValueError, TypeError):
-                    pass
+                    i = found_end + 1
+                    continue
 
         remaining_chars.append(ch)
         i += 1
@@ -303,7 +326,7 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
     stripped_all = raw_text.strip().lstrip("\ufeff")
 
-    # 1. Extract all balanced JSON objects / arrays first (handles single-line & multi-line pretty JSON)
+    # 1. Extract all balanced JSON / single-quoted dict blocks first
     json_blocks, leftover_text = _extract_balanced_json_blocks(stripped_all)
     for jb in json_blocks:
         if jb and jb not in seen:
@@ -316,11 +339,9 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
         if not line or line in (",", ";"):
             continue
 
-        if is_valid_json_item(line):
-            try:
-                norm_j = json.dumps(json.loads(line), ensure_ascii=False, separators=(",", ":"))
-            except (ValueError, TypeError):
-                norm_j = line
+        ok, parsed, is_strict_json = _parse_structured_object(line)
+        if ok:
+            norm_j = _format_structured_block(line, parsed, is_strict_json)
             if norm_j not in seen:
                 seen.add(norm_j)
                 cleaned_items.append(norm_j)
@@ -355,11 +376,12 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
 def code_to_firebase_key(code: str) -> str:
     stripped = code.strip()
-    if is_valid_json_item(stripped):
-        try:
-            stripped = json.dumps(json.loads(stripped), ensure_ascii=False, separators=(",", ":"))
-        except (ValueError, TypeError):
-            pass
+    ok, parsed, is_strict_json = _parse_structured_object(stripped)
+    if ok:
+        if is_strict_json:
+            stripped = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+        else:
+            stripped = repr(parsed)
     return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:32]
 
 
@@ -981,7 +1003,6 @@ def _find_matching_withdrawn_keys(
     matched_withdrawn_keys: set[str] = set()
     clean_fname = source_filename.strip()
 
-    # Check recorded admin_withdrawals batches (matches exact filename + quantity OR withdrawn code keys)
     all_withdrawals = fb_ref("admin_withdrawals").get()
     if isinstance(all_withdrawals, dict):
         for wdata in all_withdrawals.values():
@@ -1024,7 +1045,6 @@ def _insert_unique_codes_into_firebase(
 
         existing_entry = existing_dict.get(ckey)
         if isinstance(existing_entry, dict):
-            # Allow re-adding if it was withdrawn by admin (either matched batch or marked is_withdrawn)
             if existing_entry.get("is_withdrawn") and (
                 ckey in re_addable_withdrawn_keys or not existing_entry.get("is_sold")
             ):
@@ -1971,30 +1991,32 @@ def build_delivered_codes_file(
 ) -> io.BytesIO:
     """Builds a downloadable .json or .txt BytesIO buffer when quantity > 1."""
     clean_items = [str(raw).strip() for raw in codes if str(raw).strip()]
-    all_json = bool(clean_items) and all(is_valid_json_item(c) for c in clean_items)
+    parsed_strict_objs: list[Any] = []
+    all_strict_json = bool(clean_items)
+
+    for c in clean_items:
+        ok, parsed, is_strict = _parse_structured_object(c)
+        if ok and is_strict:
+            parsed_strict_objs.append(parsed)
+        else:
+            all_strict_json = False
+            break
+
     safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", base_label).strip("_") or "order"
 
-    if all_json:
-        parsed_objs = []
-        for c in clean_items:
-            try:
-                parsed_objs.append(json.loads(c))
-            except (ValueError, TypeError):
-                parsed_objs.append(c)
-        content_str = json.dumps(parsed_objs, indent=2, ensure_ascii=False)
+    if all_strict_json:
+        content_str = json.dumps(parsed_strict_objs, indent=2, ensure_ascii=False)
         bio = io.BytesIO(content_str.encode("utf-8"))
         bio.name = f"{safe_slug}_{len(clean_items)}_items.json"
     else:
         formatted_lines: list[str] = []
         for c in clean_items:
-            if is_valid_json_item(c):
-                try:
-                    formatted_lines.append(json.dumps(json.loads(c), indent=2, ensure_ascii=False))
-                except (ValueError, TypeError):
-                    formatted_lines.append(c)
+            ok, parsed, is_strict = _parse_structured_object(c)
+            if ok and is_strict and "\n" not in c:
+                formatted_lines.append(json.dumps(parsed, indent=2, ensure_ascii=False))
             else:
                 formatted_lines.append(c)
-        content_str = "\n".join(formatted_lines)
+        content_str = "\n\n".join(formatted_lines) if any(is_valid_json_item(x) for x in clean_items) else "\n".join(formatted_lines)
         bio = io.BytesIO(content_str.encode("utf-8"))
         bio.name = f"{safe_slug}_{len(clean_items)}_codes.txt"
 
@@ -2008,12 +2030,13 @@ def format_delivered_codes_block(codes: list[Any]) -> str:
     lines: list[str] = []
     for raw in codes:
         c = str(raw).strip()
-        if is_valid_json_item(c):
-            try:
-                pretty = json.dumps(json.loads(c), indent=2, ensure_ascii=False)
-                lines.append(f"<pre>{html.escape(pretty)}</pre>")
-            except (ValueError, TypeError):
-                lines.append(f"• <code>{html.escape(c)}</code>")
+        ok, parsed, is_strict = _parse_structured_object(c)
+        if ok:
+            if is_strict and "\n" not in c:
+                pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+            else:
+                pretty = c
+            lines.append(f"<pre>{html.escape(pretty)}</pre>")
         else:
             lines.append(f"• <code>{html.escape(c)}</code>")
     return "\n".join(lines)
