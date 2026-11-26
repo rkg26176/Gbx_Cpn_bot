@@ -221,45 +221,109 @@ def is_valid_json_item(value: str) -> bool:
     return False
 
 
+def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
+    """Extracts single-line or multi-line JSON objects/arrays accurately without splitting keys."""
+    extracted: list[str] = []
+    remaining_chars: list[str] = []
+    n = len(text)
+    i = 0
+
+    while i < n:
+        ch = text[i]
+        if ch in ("{", "["):
+            open_ch = ch
+            close_ch = "}" if ch == "{" else "]"
+            depth = 0
+            in_str = False
+            escape = False
+            j = i
+            found_end = -1
+
+            while j < n:
+                c = text[j]
+                if escape:
+                    escape = False
+                elif c == "\\":
+                    if in_str:
+                        escape = True
+                elif c == '"':
+                    in_str = not in_str
+                elif not in_str:
+                    if c == open_ch:
+                        depth += 1
+                    elif c == close_ch:
+                        depth -= 1
+                        if depth == 0:
+                            found_end = j
+                            break
+                j += 1
+
+            if found_end != -1:
+                candidate = text[i : found_end + 1].strip()
+                try:
+                    parsed = json.loads(candidate)
+                    if isinstance(parsed, list):
+                        # If it's a top-level list of dicts/strings/lists, unpack elements
+                        if i == 0 and found_end == n - 1:
+                            for elem in parsed:
+                                if isinstance(elem, (dict, list)):
+                                    extracted.append(
+                                        json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
+                                    )
+                                else:
+                                    s_el = str(elem).strip()
+                                    if s_el:
+                                        extracted.append(s_el)
+                        else:
+                            extracted.append(
+                                json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                            )
+                        i = found_end + 1
+                        continue
+                    elif isinstance(parsed, dict):
+                        extracted.append(
+                            json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+                        )
+                        i = found_end + 1
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+        remaining_chars.append(ch)
+        i += 1
+
+    return extracted, "".join(remaining_chars)
+
+
 def parse_coupons_or_links(raw_text: str) -> list[str]:
     if not raw_text:
         return []
     cleaned_items: list[str] = []
     seen: set[str] = set()
 
-    stripped_all = raw_text.strip()
-    if (stripped_all.startswith("[") and stripped_all.endswith("]")) or (
-        stripped_all.startswith("{") and stripped_all.endswith("}")
-    ):
-        try:
-            parsed_top = json.loads(stripped_all)
-            if isinstance(parsed_top, list):
-                for elem in parsed_top:
-                    if isinstance(elem, (dict, list)):
-                        item_str = json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
-                    else:
-                        item_str = str(elem).strip()
-                    if item_str and item_str not in seen:
-                        seen.add(item_str)
-                        cleaned_items.append(item_str)
-                if cleaned_items:
-                    return cleaned_items
-            elif isinstance(parsed_top, dict):
-                item_str = json.dumps(parsed_top, ensure_ascii=False, separators=(",", ":"))
-                if item_str:
-                    return [item_str]
-        except (ValueError, TypeError):
-            pass
+    stripped_all = raw_text.strip().lstrip("\ufeff")
 
-    for raw_line in raw_text.splitlines():
+    # 1. Extract all balanced JSON objects / arrays first (handles single-line & multi-line pretty JSON)
+    json_blocks, leftover_text = _extract_balanced_json_blocks(stripped_all)
+    for jb in json_blocks:
+        if jb and jb not in seen:
+            seen.add(jb)
+            cleaned_items.append(jb)
+
+    # 2. Parse any remaining non-JSON lines (coupon codes or URLs)
+    for raw_line in leftover_text.splitlines():
         line = raw_line.strip()
-        if not line:
+        if not line or line in (",", ";"):
             continue
 
         if is_valid_json_item(line):
-            if line not in seen:
-                seen.add(line)
-                cleaned_items.append(line)
+            try:
+                norm_j = json.dumps(json.loads(line), ensure_ascii=False, separators=(",", ":"))
+            except (ValueError, TypeError):
+                norm_j = line
+            if norm_j not in seen:
+                seen.add(norm_j)
+                cleaned_items.append(norm_j)
             continue
 
         if (line.startswith("{") and line.endswith("}")) or (
@@ -290,7 +354,13 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
 
 def code_to_firebase_key(code: str) -> str:
-    return hashlib.sha256(code.strip().encode("utf-8")).hexdigest()[:32]
+    stripped = code.strip()
+    if is_valid_json_item(stripped):
+        try:
+            stripped = json.dumps(json.loads(stripped), ensure_ascii=False, separators=(",", ":"))
+        except (ValueError, TypeError):
+            pass
+    return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:32]
 
 
 # =====================================================================
@@ -900,13 +970,47 @@ def update_item_price_in_firebase(
     }
 
 
+def _find_matching_withdrawn_keys(
+    codes: list[str], source_filename: str = ""
+) -> set[str]:
+    """Finds Firebase keys of codes that were withdrawn by admin so they can be re-added without duplicate error."""
+    target_keys = {code_to_firebase_key(c) for c in codes}
+    if not target_keys:
+        return set()
+
+    matched_withdrawn_keys: set[str] = set()
+    clean_fname = source_filename.strip()
+
+    # Check recorded admin_withdrawals batches (matches exact filename + quantity OR withdrawn code keys)
+    all_withdrawals = fb_ref("admin_withdrawals").get()
+    if isinstance(all_withdrawals, dict):
+        for wdata in all_withdrawals.values():
+            if not isinstance(wdata, dict):
+                continue
+            w_codes = wdata.get("codes") or []
+            if not isinstance(w_codes, list) or not w_codes:
+                continue
+            w_keys = {code_to_firebase_key(str(wc)) for wc in w_codes}
+            w_fname = str(wdata.get("filename") or "").strip()
+            w_qty = int(wdata.get("quantity", len(w_codes)))
+
+            if clean_fname and w_fname == clean_fname and len(codes) == w_qty:
+                matched_withdrawn_keys.update(target_keys & w_keys)
+            elif target_keys.issubset(w_keys):
+                matched_withdrawn_keys.update(target_keys & w_keys)
+
+    return matched_withdrawn_keys
+
+
 def _insert_unique_codes_into_firebase(
-    slot_id: str, sub_id: str, codes: list[str]
+    slot_id: str, sub_id: str, codes: list[str], source_filename: str = ""
 ) -> tuple[int, int]:
     now_iso = datetime.now(timezone.utc).isoformat()
     codes_ref = fb_ref("coupon_codes")
     existing_all = codes_ref.get()
-    existing_keys = set(existing_all.keys()) if isinstance(existing_all, dict) else set()
+    existing_dict = existing_all if isinstance(existing_all, dict) else {}
+
+    re_addable_withdrawn_keys = _find_matching_withdrawn_keys(codes, source_filename)
 
     updates: dict[str, Any] = {}
     added = 0
@@ -914,9 +1018,29 @@ def _insert_unique_codes_into_firebase(
 
     for code in codes:
         ckey = code_to_firebase_key(code)
-        if ckey in existing_keys or ckey in updates:
+        if ckey in updates:
             duplicates += 1
             continue
+
+        existing_entry = existing_dict.get(ckey)
+        if isinstance(existing_entry, dict):
+            # Allow re-adding if it was withdrawn by admin (either matched batch or marked is_withdrawn)
+            if existing_entry.get("is_withdrawn") and (
+                ckey in re_addable_withdrawn_keys or not existing_entry.get("is_sold")
+            ):
+                updates[ckey] = {
+                    "slot_id": slot_id,
+                    "sub_id": sub_id,
+                    "code": code,
+                    "is_sold": False,
+                    "is_withdrawn": False,
+                    "created_at": now_iso,
+                }
+                added += 1
+                continue
+            duplicates += 1
+            continue
+
         updates[ckey] = {
             "slot_id": slot_id,
             "sub_id": sub_id,
@@ -939,6 +1063,7 @@ def create_slot_or_folder_item(
     description: str,
     unit_price: float,
     codes: list[str],
+    source_filename: str = "",
 ) -> dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     clean_main = main_name.strip()
@@ -976,7 +1101,9 @@ def create_slot_or_folder_item(
                 }
             )
 
-        added, dups = _insert_unique_codes_into_firebase(slot_id, "", codes)
+        added, dups = _insert_unique_codes_into_firebase(
+            slot_id, "", codes, source_filename=source_filename
+        )
         item_info = fetch_sellable_item(slot_id, "")
         return {
             "is_folder": False,
@@ -1040,7 +1167,9 @@ def create_slot_or_folder_item(
             }
         )
 
-    added, dups = _insert_unique_codes_into_firebase(folder_id, sub_id, codes)
+    added, dups = _insert_unique_codes_into_firebase(
+        folder_id, sub_id, codes, source_filename=source_filename
+    )
     item_info = fetch_sellable_item(folder_id, sub_id)
     return {
         "is_folder": True,
@@ -1056,13 +1185,15 @@ def create_slot_or_folder_item(
 
 
 def direct_add_to_target(
-    slot_id: str, sub_id: str, codes: list[str]
+    slot_id: str, sub_id: str, codes: list[str], source_filename: str = ""
 ) -> dict[str, Any]:
     item = fetch_sellable_item(slot_id, sub_id)
     if not item:
         return {"ok": False, "reason": "Target slot or sub-item not found."}
 
-    added, dups = _insert_unique_codes_into_firebase(slot_id, sub_id, codes)
+    added, dups = _insert_unique_codes_into_firebase(
+        slot_id, sub_id, codes, source_filename=source_filename
+    )
     updated = fetch_sellable_item(slot_id, sub_id)
     return {
         "ok": True,
@@ -1116,6 +1247,9 @@ def withdraw_codes_for_admin(
     chosen = available_entries[:take_qty]
 
     withdrawal_id = f"WDR{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(item["display_name"])).strip("_") or "codes"
+    export_filename = f"{safe_slug}_{take_qty}_codes.txt"
+
     updates: dict[str, Any] = {}
     withdrawn_list: list[str] = []
 
@@ -1134,6 +1268,7 @@ def withdraw_codes_for_admin(
             "slot_id": slot_id,
             "sub_id": sub_id,
             "item_name": item["display_name"],
+            "filename": export_filename,
             "quantity": take_qty,
             "codes": withdrawn_list,
             "created_at": now_iso,
@@ -1144,6 +1279,7 @@ def withdraw_codes_for_admin(
         "ok": True,
         "withdrawal_id": withdrawal_id,
         "display_name": item["display_name"],
+        "filename": export_filename,
         "withdrawn_count": take_qty,
         "remaining_stock": avail_count - take_qty,
         "codes": withdrawn_list,
@@ -1830,7 +1966,45 @@ def format_username(username: str | None) -> str:
     return "Not set"
 
 
+def build_delivered_codes_file(
+    codes: list[Any], base_label: str
+) -> io.BytesIO:
+    """Builds a downloadable .json or .txt BytesIO buffer when quantity > 1."""
+    clean_items = [str(raw).strip() for raw in codes if str(raw).strip()]
+    all_json = bool(clean_items) and all(is_valid_json_item(c) for c in clean_items)
+    safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", base_label).strip("_") or "order"
+
+    if all_json:
+        parsed_objs = []
+        for c in clean_items:
+            try:
+                parsed_objs.append(json.loads(c))
+            except (ValueError, TypeError):
+                parsed_objs.append(c)
+        content_str = json.dumps(parsed_objs, indent=2, ensure_ascii=False)
+        bio = io.BytesIO(content_str.encode("utf-8"))
+        bio.name = f"{safe_slug}_{len(clean_items)}_items.json"
+    else:
+        formatted_lines: list[str] = []
+        for c in clean_items:
+            if is_valid_json_item(c):
+                try:
+                    formatted_lines.append(json.dumps(json.loads(c), indent=2, ensure_ascii=False))
+                except (ValueError, TypeError):
+                    formatted_lines.append(c)
+            else:
+                formatted_lines.append(c)
+        content_str = "\n".join(formatted_lines)
+        bio = io.BytesIO(content_str.encode("utf-8"))
+        bio.name = f"{safe_slug}_{len(clean_items)}_codes.txt"
+
+    bio.seek(0)
+    return bio
+
+
 def format_delivered_codes_block(codes: list[Any]) -> str:
+    if len(codes) > 1:
+        return f"• <i>{len(codes)} items attached in the file below.</i>"
     lines: list[str] = []
     for raw in codes:
         c = str(raw).strip()
@@ -1843,6 +2017,32 @@ def format_delivered_codes_block(codes: list[Any]) -> str:
         else:
             lines.append(f"• <code>{html.escape(c)}</code>")
     return "\n".join(lines)
+
+
+async def send_order_attachment_if_multi(
+    bot: Any,
+    chat_id: int,
+    res: dict[str, Any],
+) -> None:
+    codes = res.get("delivered_codes") or []
+    if len(codes) <= 1:
+        return
+    bio = build_delivered_codes_file(
+        codes, base_label=str(res.get("order_id") or res.get("coupon_name") or "order")
+    )
+    try:
+        await bot.send_document(
+            chat_id=chat_id,
+            document=bio,
+            caption=(
+                f"📄 <b>Order ID:</b> <code>{html.escape(str(res.get('order_id', '')))}</code>\n"
+                f"• <b>Item:</b> {html.escape(str(res.get('coupon_name', '')))}\n"
+                f"• <b>Delivered Quantity:</b> {len(codes)}"
+            ),
+            parse_mode="HTML",
+        )
+    except TelegramError as exc:
+        logger.error("Failed to send multi-item order file to %s: %s", chat_id, exc)
 
 
 # =====================================================================
@@ -2032,6 +2232,13 @@ async def notify_admin_coupon_order_delivery(
             text=log_text,
             parse_mode="HTML",
         )
+        if len(delivered_codes) > 1:
+            bio = build_delivered_codes_file(delivered_codes, base_label=order_id)
+            await context.bot.send_document(
+                chat_id=ADMIN_ID,
+                document=bio,
+                caption=f"📄 Admin Copy — Order {order_id} ({len(delivered_codes)} items)",
+            )
     except TelegramError as exc:
         logger.error("Failed to send admin order delivery log to %s: %s", ADMIN_ID, exc)
 
@@ -4224,6 +4431,7 @@ async def run_utr_verification_flow(
                     format_delivered_receipt(order_res),
                     parse_mode="HTML",
                 )
+                await send_order_attachment_if_multi(context.bot, chat_id, order_res)
                 await notify_admin_coupon_order_delivery(
                     context=context,
                     user_id=user_id,
@@ -5098,7 +5306,7 @@ async def handle_inline_callbacks(
                     f"• <b>Current Live Stock:</b> <b>{int(item['stock'])}</b>\n\n"
                     "Send your coupon codes, links, or JSON data now:\n"
                     "• Upload a <code>.txt</code> / <code>.json</code> file, <b>OR</b>\n"
-                    "• Paste them directly line-by-line in chat (case-sensitive JSON, links &amp; codes are preserved)."
+                    "• Paste them directly in chat (single-line or multi-line JSON, links &amp; codes are preserved)."
                 ),
                 reply_markup=kb,
                 parse_mode="HTML",
@@ -5367,6 +5575,9 @@ async def handle_inline_callbacks(
                         parse_mode="HTML",
                     )
 
+            target_chat_id = update.effective_chat.id if update.effective_chat else user.id
+            await send_order_attachment_if_multi(context.bot, target_chat_id, purchase_res)
+
             await notify_admin_coupon_order_delivery(
                 context=context,
                 user_id=user.id,
@@ -5626,8 +5837,11 @@ async def send_withdrawn_codes_file(
     codes: list[str] = res.get("codes", [])
     content_bytes = "\n".join(codes).encode("utf-8")
     bio = io.BytesIO(content_bytes)
-    safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(res["display_name"])).strip("_") or "codes"
-    bio.name = f"{safe_slug}_{res['withdrawn_count']}_codes.txt"
+    export_fname = str(res.get("filename") or "").strip()
+    if not export_fname:
+        safe_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(res["display_name"])).strip("_") or "codes"
+        export_fname = f"{safe_slug}_{res['withdrawn_count']}_codes.txt"
+    bio.name = export_fname
     bio.seek(0)
 
     summary_text = (
@@ -6157,7 +6371,7 @@ async def handle_admin_panel_inputs(
                 "🎟️ <b>Upload Coupons, Links, or JSON:</b>\n"
                 "Send your items now:\n"
                 "• Upload a <code>.txt</code> / <code>.json</code> file, <b>OR</b>\n"
-                "• Paste them directly in sequence (one per line). Case-sensitive JSON, codes, and URLs are preserved and saved to Firebase.",
+                "• Paste them directly (single-line or multi-line JSON, codes, and URLs are accurately extracted and saved to Firebase).",
                 reply_markup=cancel_kb,
                 parse_mode="HTML",
             )
@@ -6165,8 +6379,10 @@ async def handle_admin_panel_inputs(
 
         if step == "codes":
             raw_content = ""
+            source_filename = ""
             if msg.document:
-                fname = (msg.document.file_name or "").lower()
+                source_filename = (msg.document.file_name or "").strip()
+                fname = source_filename.lower()
                 if not fname.endswith((".txt", ".json")):
                     await msg.reply_text(
                         "❌ Please upload a valid <code>.txt</code> or <code>.json</code> file, or paste the items directly as text.",
@@ -6204,6 +6420,7 @@ async def handle_admin_panel_inputs(
                     description=str(ap_state["description"]),
                     unit_price=float(ap_state["price"]),
                     codes=parsed_items,
+                    source_filename=source_filename,
                 )
             context.user_data.pop("admin_panel_state", None)
 
@@ -6229,8 +6446,10 @@ async def handle_admin_panel_inputs(
         sid = str(ap_state.get("slot_id", ""))
         sub_id = str(ap_state.get("sub_id", ""))
         raw_content = ""
+        source_filename = ""
         if msg.document:
-            fname = (msg.document.file_name or "").lower()
+            source_filename = (msg.document.file_name or "").strip()
+            fname = source_filename.lower()
             if not fname.endswith((".txt", ".json")):
                 await msg.reply_text(
                     "❌ Please upload a valid <code>.txt</code> or <code>.json</code> file, or paste the items directly as text.",
@@ -6261,7 +6480,12 @@ async def handle_admin_panel_inputs(
             return True
 
         async with _INVENTORY_LOCK:
-            res = direct_add_to_target(slot_id=sid, sub_id=sub_id, codes=parsed_items)
+            res = direct_add_to_target(
+                slot_id=sid,
+                sub_id=sub_id,
+                codes=parsed_items,
+                source_filename=source_filename,
+            )
         context.user_data.pop("admin_panel_state", None)
 
         if not res.get("ok"):
