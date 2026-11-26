@@ -219,7 +219,7 @@ _QUOTE_OPEN_TO_CLOSE: dict[str, str] = {
 
 
 def _normalize_relaxed_json_quotes(raw_block: str) -> str:
-    """Converts backticks, curly quotes, or unquoted keys into valid double-quoted JSON."""
+    """Converts backticks, curly quotes, or Telegram-stripped unquoted keys/values into valid JSON."""
     out: list[str] = []
     n = len(raw_block)
     i = 0
@@ -255,15 +255,33 @@ def _normalize_relaxed_json_quotes(raw_block: str) -> str:
         out.append(ch)
         i += 1
     normalized = "".join(out)
-    # Quote unquoted JS/JSON keys if Telegram stripped backticks (e.g. { mobile: "123" })
+    # Quote unquoted keys (e.g. mobile: ...)
     normalized = re.sub(r'([\{\[,]\s*)([a-zA-Z0-9_$-]+)\s*:', r'\1"\2":', normalized)
+    # Handle empty values left behind when Telegram strips `` (e.g. "name": , -> "name": "")
+    normalized = re.sub(r':\s*(?=[,\}\]])', ': ""', normalized)
+    # Quote unquoted scalar string/UUID/JWT values (e.g. "token": a5140d68-...)
+    def _quote_unquoted_val(m: re.Match[str]) -> str:
+        prefix = m.group(1)
+        val = m.group(2).strip()
+        if not val:
+            return f'{prefix}""'
+        if val in ("true", "false", "null") or re.fullmatch(r"-?\d+(\.\d+)?([eE][+-]?\d+)?", val):
+            return f"{prefix}{val}"
+        escaped_val = val.replace("\\", "\\\\").replace('"', '\\"')
+        return f'{prefix}"{escaped_val}"'
+
+    normalized = re.sub(
+        r'(:\s*)([^"\[\{\}\],\s][^,\}\]]*?)(?=\s*[,\}\]])',
+        _quote_unquoted_val,
+        normalized,
+    )
     # Remove trailing commas before } or ]
     normalized = re.sub(r",\s*([\}\]])", r"\1", normalized)
     return normalized
 
 
 def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
-    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), curly quotes, or unquoted keys.
+    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), curly quotes, or Telegram-stripped JSON.
     Returns (is_valid, parsed_obj, is_strict_json).
     """
     s = raw_block.strip()
@@ -288,7 +306,7 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
     except (ValueError, SyntaxError, TypeError):
         pass
 
-    # 3. Backtick-quoted (`key`: `val`), Smart-quoted, or Unquoted-key JSON from any app/Telegram copy-paste
+    # 3. Backtick-quoted (`key`: `val`), Smart-quoted, or Telegram-stripped JSON from any app
     try:
         norm_s = _normalize_relaxed_json_quotes(s)
         parsed_norm = json.loads(norm_s)
@@ -296,6 +314,10 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
             return True, parsed_norm, False
     except (ValueError, TypeError):
         pass
+
+    # 4. Fallback: if it is a balanced { key: val } or [ ... ] block containing ":" (key-value structure)
+    if s.startswith("{") and s.endswith("}") and ":" in s:
+        return True, s, False
 
     return False, None, False
 
@@ -441,7 +463,7 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 def code_to_firebase_key(code: str) -> str:
     stripped = code.strip()
     ok, parsed, _ = _parse_structured_object(stripped)
-    if ok:
+    if ok and isinstance(parsed, (dict, list)):
         try:
             stripped = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         except (ValueError, TypeError):
