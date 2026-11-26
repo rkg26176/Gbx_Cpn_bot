@@ -219,7 +219,7 @@ _QUOTE_OPEN_TO_CLOSE: dict[str, str] = {
 
 
 def _normalize_relaxed_json_quotes(raw_block: str) -> str:
-    """Converts backticks or curly quotes wrapping keys/strings into valid double-quoted JSON."""
+    """Converts backticks, curly quotes, or unquoted keys into valid double-quoted JSON."""
     out: list[str] = []
     n = len(raw_block)
     i = 0
@@ -254,13 +254,16 @@ def _normalize_relaxed_json_quotes(raw_block: str) -> str:
                 continue
         out.append(ch)
         i += 1
-    # Remove trailing commas before } or ] if present
-    normalized = re.sub(r",\s*([\}\]])", r"\1", "".join(out))
+    normalized = "".join(out)
+    # Quote unquoted JS/JSON keys if Telegram stripped backticks (e.g. { mobile: "123" })
+    normalized = re.sub(r'([\{\[,]\s*)([a-zA-Z0-9_$-]+)\s*:', r'\1"\2":', normalized)
+    # Remove trailing commas before } or ]
+    normalized = re.sub(r",\s*([\}\]])", r"\1", normalized)
     return normalized
 
 
 def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
-    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), or curly quotes.
+    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), curly quotes, or unquoted keys.
     Returns (is_valid, parsed_obj, is_strict_json).
     """
     s = raw_block.strip()
@@ -285,7 +288,7 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
     except (ValueError, SyntaxError, TypeError):
         pass
 
-    # 3. Backtick-quoted (`key`: `val`) or Smart-quoted JSON from any app/copy-paste
+    # 3. Backtick-quoted (`key`: `val`), Smart-quoted, or Unquoted-key JSON from any app/Telegram copy-paste
     try:
         norm_s = _normalize_relaxed_json_quotes(s)
         parsed_norm = json.loads(norm_s)
@@ -359,14 +362,9 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
                     if isinstance(parsed, list) and i == 0 and found_end == n - 1:
                         for elem in parsed:
                             if isinstance(elem, (dict, list)):
-                                if is_strict_json:
-                                    extracted.append(
-                                        json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
-                                    )
-                                else:
-                                    extracted.append(
-                                        json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
-                                    )
+                                extracted.append(
+                                    json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
+                                )
                             else:
                                 s_el = str(elem).strip()
                                 if s_el:
