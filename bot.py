@@ -209,8 +209,58 @@ def format_qty_expression(quantity: int) -> str:
     return f"1 * {quantity}"
 
 
+_QUOTE_OPEN_TO_CLOSE: dict[str, str] = {
+    '"': '"',
+    "'": "'",
+    "`": "`",
+    "“": "”",
+    "‘": "’",
+}
+
+
+def _normalize_relaxed_json_quotes(raw_block: str) -> str:
+    """Converts backticks or curly quotes wrapping keys/strings into valid double-quoted JSON."""
+    out: list[str] = []
+    n = len(raw_block)
+    i = 0
+    while i < n:
+        ch = raw_block[i]
+        if ch in _QUOTE_OPEN_TO_CLOSE:
+            close_ch = _QUOTE_OPEN_TO_CLOSE[ch]
+            j = i + 1
+            buf: list[str] = []
+            while j < n:
+                c = raw_block[j]
+                if c == "\\" and j + 1 < n:
+                    nxt = raw_block[j + 1]
+                    if nxt == '"':
+                        buf.append('\\"')
+                    elif nxt in ("'", "`"):
+                        buf.append(nxt)
+                    else:
+                        buf.append("\\" + nxt)
+                    j += 2
+                    continue
+                if c == close_ch:
+                    break
+                if c == '"':
+                    buf.append('\\"')
+                else:
+                    buf.append(c)
+                j += 1
+            if j < n and raw_block[j] == close_ch:
+                out.append('"' + "".join(buf) + '"')
+                i = j + 1
+                continue
+        out.append(ch)
+        i += 1
+    # Remove trailing commas before } or ] if present
+    normalized = re.sub(r",\s*([\}\]])", r"\1", "".join(out))
+    return normalized
+
+
 def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
-    """Parses standard JSON (double-quoted) OR Python-style dict/list (single-quoted).
+    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), or curly quotes.
     Returns (is_valid, parsed_obj, is_strict_json).
     """
     s = raw_block.strip()
@@ -218,18 +268,32 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
         return False, None, False
     if not ((s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))):
         return False, None, False
+
+    # 1. Standard strict JSON
     try:
         parsed = json.loads(s)
         if isinstance(parsed, (dict, list)):
             return True, parsed, True
     except (ValueError, TypeError):
         pass
+
+    # 2. Python dict/list literal (single-quoted strings, True/False/None)
     try:
         parsed_ast = ast.literal_eval(s)
         if isinstance(parsed_ast, (dict, list)):
             return True, parsed_ast, False
     except (ValueError, SyntaxError, TypeError):
         pass
+
+    # 3. Backtick-quoted (`key`: `val`) or Smart-quoted JSON from any app/copy-paste
+    try:
+        norm_s = _normalize_relaxed_json_quotes(s)
+        parsed_norm = json.loads(norm_s)
+        if isinstance(parsed_norm, (dict, list)):
+            return True, parsed_norm, False
+    except (ValueError, TypeError):
+        pass
+
     return False, None, False
 
 
@@ -239,7 +303,7 @@ def is_valid_json_item(value: str) -> bool:
 
 
 def _format_structured_block(raw_block: str, parsed_obj: Any, is_strict_json: bool) -> str:
-    """Preserves original clean formatting (including single-quoted or double-quoted JSON blocks)."""
+    """Preserves original formatting for multi-line/custom-quoted blocks, or compact JSON for single-line."""
     s = raw_block.strip()
     if "\n" in s:
         return s
@@ -249,7 +313,7 @@ def _format_structured_block(raw_block: str, parsed_obj: Any, is_strict_json: bo
 
 
 def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
-    """Extracts single-line or multi-line JSON/dict objects & arrays (supports both ' and \")."""
+    """Extracts single-line or multi-line JSON/dict objects & arrays for ANY app (supports \", ', `, “”, ‘’)."""
     extracted: list[str] = []
     remaining_chars: list[str] = []
     n = len(text)
@@ -261,7 +325,7 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
             open_ch = ch
             close_ch = "}" if ch == "{" else "]"
             depth = 0
-            quote_char: str | None = None
+            expected_close_quote: str | None = None
             escape = False
             j = i
             found_end = -1
@@ -271,14 +335,14 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
                 if escape:
                     escape = False
                 elif c == "\\":
-                    if quote_char is not None:
+                    if expected_close_quote is not None:
                         escape = True
-                elif quote_char is not None:
-                    if c == quote_char:
-                        quote_char = None
+                elif expected_close_quote is not None:
+                    if c == expected_close_quote:
+                        expected_close_quote = None
                 else:
-                    if c in ('"', "'"):
-                        quote_char = c
+                    if c in _QUOTE_OPEN_TO_CLOSE:
+                        expected_close_quote = _QUOTE_OPEN_TO_CLOSE[c]
                     elif c == open_ch:
                         depth += 1
                     elif c == close_ch:
@@ -300,7 +364,9 @@ def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
                                         json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
                                     )
                                 else:
-                                    extracted.append(repr(elem))
+                                    extracted.append(
+                                        json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
+                                    )
                             else:
                                 s_el = str(elem).strip()
                                 if s_el:
@@ -326,7 +392,7 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
     stripped_all = raw_text.strip().lstrip("\ufeff")
 
-    # 1. Extract all balanced JSON / single-quoted dict blocks first
+    # 1. Extract all balanced JSON / dict / array blocks first (works for any app's JSON)
     json_blocks, leftover_text = _extract_balanced_json_blocks(stripped_all)
     for jb in json_blocks:
         if jb and jb not in seen:
@@ -376,11 +442,11 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
 def code_to_firebase_key(code: str) -> str:
     stripped = code.strip()
-    ok, parsed, is_strict_json = _parse_structured_object(stripped)
+    ok, parsed, _ = _parse_structured_object(stripped)
     if ok:
-        if is_strict_json:
-            stripped = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
-        else:
+        try:
+            stripped = json.dumps(parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (ValueError, TypeError):
             stripped = repr(parsed)
     return hashlib.sha256(stripped.encode("utf-8")).hexdigest()[:32]
 
