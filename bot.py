@@ -167,6 +167,7 @@ BTN_MAIN_CHANNELS = "📢 Our Main Channels"
 # Concurrency locks
 _USER_LOCKS: dict[int, asyncio.Lock] = {}
 _INVENTORY_LOCK = asyncio.Lock()
+_PROMO_LOCK = asyncio.Lock()
 URL_DETECT_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)", re.IGNORECASE)
 
 _KB_SUPPORTS_STYLE = "style" in inspect.signature(KeyboardButton.__init__).parameters
@@ -207,16 +208,68 @@ def format_qty_expression(quantity: int) -> str:
     return f"1 * {quantity}"
 
 
+def is_valid_json_item(value: str) -> bool:
+    s = value.strip()
+    if len(s) < 2:
+        return False
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        try:
+            parsed = json.loads(s)
+            return isinstance(parsed, (dict, list))
+        except (ValueError, TypeError):
+            return False
+    return False
+
+
 def parse_coupons_or_links(raw_text: str) -> list[str]:
     if not raw_text:
         return []
     cleaned_items: list[str] = []
     seen: set[str] = set()
 
+    stripped_all = raw_text.strip()
+    if (stripped_all.startswith("[") and stripped_all.endswith("]")) or (
+        stripped_all.startswith("{") and stripped_all.endswith("}")
+    ):
+        try:
+            parsed_top = json.loads(stripped_all)
+            if isinstance(parsed_top, list):
+                for elem in parsed_top:
+                    if isinstance(elem, (dict, list)):
+                        item_str = json.dumps(elem, ensure_ascii=False, separators=(",", ":"))
+                    else:
+                        item_str = str(elem).strip()
+                    if item_str and item_str not in seen:
+                        seen.add(item_str)
+                        cleaned_items.append(item_str)
+                if cleaned_items:
+                    return cleaned_items
+            elif isinstance(parsed_top, dict):
+                item_str = json.dumps(parsed_top, ensure_ascii=False, separators=(",", ":"))
+                if item_str:
+                    return [item_str]
+        except (ValueError, TypeError):
+            pass
+
     for raw_line in raw_text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
+
+        if is_valid_json_item(line):
+            if line not in seen:
+                seen.add(line)
+                cleaned_items.append(line)
+            continue
+
+        if (line.startswith("{") and line.endswith("}")) or (
+            line.startswith("[") and line.endswith("]")
+        ):
+            if line not in seen:
+                seen.add(line)
+                cleaned_items.append(line)
+            continue
+
         if "http://" in line.lower() or "https://" in line.lower():
             parts = [p.strip() for p in re.split(r"[\s,]+", line) if p.strip()]
         elif "," in line and " " not in line.replace(",", ""):
@@ -225,7 +278,9 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
             parts = [line]
 
         for item in parts:
-            if not item.lower().startswith(("http://", "https://")):
+            if not item.lower().startswith(("http://", "https://")) and not (
+                item.startswith(("{", "[")) and item.endswith(("}", "]"))
+            ):
                 item = re.sub(r"^(?:\d+[\.\)\-:]\s*|[\-\*\•]\s*)", "", item).strip()
             if item and item not in seen:
                 seen.add(item)
@@ -466,6 +521,200 @@ async def token_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     elif status_code == 200 and cfg.get("token_alert_sent", False):
         cfg["token_alert_sent"] = False
         save_bharatpe_config(cfg)
+
+
+# =====================================================================
+# Firebase Bot Promo Coupons & User Refund Helpers
+# =====================================================================
+
+
+def create_bot_promo_coupon(amount: float, max_users: int) -> dict[str, Any]:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    while True:
+        code = f"GBX-{secrets.token_hex(3).upper()}-{secrets.token_hex(2).upper()}"
+        if fb_ref(f"bot_promo_coupons/{code}").get() is None:
+            break
+
+    data = {
+        "code": code,
+        "amount": round(float(amount), 2),
+        "max_users": int(max_users),
+        "claimed_count": 0,
+        "claimed_by": {},
+        "is_active": True,
+        "created_at": now_iso,
+    }
+    fb_ref(f"bot_promo_coupons/{code}").set(data)
+    return data
+
+
+def redeem_bot_promo_coupon(user_id: int, raw_code: str) -> dict[str, Any]:
+    clean_code = raw_code.strip().upper()
+    if not clean_code or not re.fullmatch(r"[A-Z0-9_-]{3,40}", clean_code):
+        return {
+            "ok": False,
+            "reason": "Invalid coupon code format. Please check the code and try again.",
+        }
+
+    cref = fb_ref(f"bot_promo_coupons/{clean_code}")
+    coupon = cref.get()
+    if not isinstance(coupon, dict):
+        return {
+            "ok": False,
+            "reason": "Coupon code not found or invalid.",
+        }
+
+    if not coupon.get("is_active", True):
+        return {
+            "ok": False,
+            "reason": "This coupon code is no longer active.",
+        }
+
+    claimed_by = coupon.get("claimed_by")
+    if not isinstance(claimed_by, dict):
+        claimed_by = {}
+
+    if str(user_id) in claimed_by:
+        return {
+            "ok": False,
+            "reason": "You have already claimed this coupon code.",
+        }
+
+    max_users = int(coupon.get("max_users", 0))
+    claimed_count = int(coupon.get("claimed_count", len(claimed_by)))
+    if claimed_count >= max_users:
+        cref.update({"is_active": False})
+        return {
+            "ok": False,
+            "reason": "This coupon has reached its maximum user claim limit.",
+        }
+
+    amount = round(float(coupon.get("amount", 0.0)), 2)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    new_claimed_count = claimed_count + 1
+    updates: dict[str, Any] = {
+        f"claimed_by/{user_id}": {
+            "user_id": user_id,
+            "amount": amount,
+            "claimed_at": now_iso,
+        },
+        "claimed_count": new_claimed_count,
+    }
+    if new_claimed_count >= max_users:
+        updates["is_active"] = False
+    cref.update(updates)
+
+    uref = fb_ref(f"users/{user_id}")
+    user = uref.get() or {}
+    prev_avail = float(user.get("wallet_balance", 0.0))
+    new_avail = round(prev_avail + amount, 2)
+    ref_bal = float(user.get("referral_earnings", 0.0))
+    uref.update({"wallet_balance": new_avail})
+
+    return {
+        "ok": True,
+        "code": clean_code,
+        "amount": amount,
+        "previous_available_balance": prev_avail,
+        "new_available_balance": new_avail,
+        "referral_balance": ref_bal,
+        "total_balance": round(new_avail + ref_bal, 2),
+        "remaining_claims": max(0, max_users - new_claimed_count),
+    }
+
+
+def process_order_wallet_refund(order_id_query: str, refund_qty: int) -> dict[str, Any]:
+    order = lookup_order_by_id(order_id_query)
+    if not isinstance(order, dict):
+        return {"ok": False, "reason": "Order ID not found in database."}
+
+    actual_order_id = str(order.get("order_id", "")).strip()
+    if not actual_order_id:
+        return {"ok": False, "reason": "Invalid order record."}
+
+    total_qty = int(order.get("quantity", 1))
+    already_refunded_qty = int(order.get("refunded_qty", 0))
+    refundable_qty = max(0, total_qty - already_refunded_qty)
+
+    if refundable_qty <= 0:
+        return {
+            "ok": False,
+            "reason": f"All {total_qty} unit(s) for Order {actual_order_id} have already been refunded.",
+        }
+
+    if refund_qty < 1 or refund_qty > refundable_qty:
+        return {
+            "ok": False,
+            "reason": f"Invalid refund quantity. You can refund between 1 and {refundable_qty} unit(s).",
+        }
+
+    unit_price = float(order.get("price", 0.0))
+    refund_amount = round(unit_price * refund_qty, 2)
+    target_user_id = int(order.get("user_id", 0))
+    if not target_user_id:
+        return {"ok": False, "reason": "Customer User ID missing on this order."}
+
+    uref = fb_ref(f"users/{target_user_id}")
+    user_data = uref.get()
+    if not isinstance(user_data, dict):
+        return {"ok": False, "reason": f"User {target_user_id} record not found in Firebase."}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    refund_id = f"RFD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
+
+    prev_avail = float(user_data.get("wallet_balance", 0.0))
+    new_avail = round(prev_avail + refund_amount, 2)
+    ref_bal = float(user_data.get("referral_earnings", 0.0))
+    uref.update({"wallet_balance": new_avail})
+
+    new_refunded_qty = already_refunded_qty + refund_qty
+    prev_refunded_amt = float(order.get("refunded_amount", 0.0))
+    new_refunded_amt = round(prev_refunded_amt + refund_amount, 2)
+
+    fb_ref(f"orders/{actual_order_id}").update(
+        {
+            "refunded_qty": new_refunded_qty,
+            "refunded_amount": new_refunded_amt,
+            "last_refund_id": refund_id,
+            "last_refund_at": now_iso,
+        }
+    )
+
+    fb_ref(f"admin_refunds/{refund_id}").set(
+        {
+            "refund_id": refund_id,
+            "order_id": actual_order_id,
+            "user_id": target_user_id,
+            "username": user_data.get("username", ""),
+            "first_name": user_data.get("first_name", ""),
+            "coupon_name": str(order.get("coupon_name", "")),
+            "refund_qty": refund_qty,
+            "total_order_qty": total_qty,
+            "unit_price": unit_price,
+            "refund_amount": refund_amount,
+            "admin_id": ADMIN_ID,
+            "created_at": now_iso,
+        }
+    )
+
+    return {
+        "ok": True,
+        "refund_id": refund_id,
+        "order_id": actual_order_id,
+        "user_id": target_user_id,
+        "username": user_data.get("username"),
+        "first_name": user_data.get("first_name"),
+        "coupon_name": str(order.get("coupon_name", "Item")),
+        "refund_qty": refund_qty,
+        "total_order_qty": total_qty,
+        "unit_price": unit_price,
+        "refund_amount": refund_amount,
+        "previous_available_balance": prev_avail,
+        "new_available_balance": new_avail,
+        "referral_balance": ref_bal,
+        "total_balance": round(new_avail + ref_bal, 2),
+    }
 
 
 # =====================================================================
@@ -1581,6 +1830,21 @@ def format_username(username: str | None) -> str:
     return "Not set"
 
 
+def format_delivered_codes_block(codes: list[Any]) -> str:
+    lines: list[str] = []
+    for raw in codes:
+        c = str(raw).strip()
+        if is_valid_json_item(c):
+            try:
+                pretty = json.dumps(json.loads(c), indent=2, ensure_ascii=False)
+                lines.append(f"<pre>{html.escape(pretty)}</pre>")
+            except (ValueError, TypeError):
+                lines.append(f"• <code>{html.escape(c)}</code>")
+        else:
+            lines.append(f"• <code>{html.escape(c)}</code>")
+    return "\n".join(lines)
+
+
 # =====================================================================
 # QR Auto-Expiry Background Job
 # =====================================================================
@@ -1740,7 +2004,7 @@ async def notify_admin_coupon_order_delivery(
     now_ist = datetime.now(IST).strftime("%d %b %Y, %I:%M:%S %p IST")
     safe_name = html.escape(first_name or "User")
     safe_username = format_username(username)
-    codes_block = "\n".join(f"• <code>{html.escape(c)}</code>" for c in delivered_codes)
+    codes_block = format_delivered_codes_block(delivered_codes)
     utr_line = f"• <b>12-Digit UTR:</b> <code>{html.escape(utr)}</code>\n" if utr else ""
 
     log_text = (
@@ -1758,7 +2022,7 @@ async def notify_admin_coupon_order_delivery(
         f"• <b>Telegram User ID:</b> <code>{user_id}</code>\n"
         f"• <b>Username:</b> {safe_username}\n"
         f"• <b>Remaining Wallet Balance:</b> ₹{remaining_total_balance:.2f}\n\n"
-        "<b>Exact Coupon(s) / Link(s) Delivered to User</b>\n"
+        "<b>Exact Coupon(s) / Link(s) / JSON Delivered to User</b>\n"
         f"{codes_block}\n\n"
         f"• <b>Timestamp:</b> {now_ist}"
     )
@@ -1807,7 +2071,7 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
-    """Broadcast, User List, Check Order ID, Maintenance Mode + Cancel button."""
+    """Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User + Cancel button."""
     return InlineKeyboardMarkup(
         [
             [
@@ -1832,6 +2096,18 @@ def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
                     text="🛠️ Maintenance Mode",
                     style="primary",
                     callback_data="adm_maintenance",
+                ),
+            ],
+            [
+                styled_inline_btn(
+                    text="🎟️ Create Coupon for Bot",
+                    style="success",
+                    callback_data="adm_create_coupon",
+                ),
+                styled_inline_btn(
+                    text="💸 Refund User",
+                    style="primary",
+                    callback_data="adm_refund_user",
                 ),
             ],
             [
@@ -2499,6 +2775,13 @@ def build_wallet_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
+                styled_inline_btn(
+                    text="🎟️ Claim Coupon",
+                    style="primary",
+                    callback_data="wallet_claim_coupon",
+                )
+            ],
+            [
                 styled_inline_btn(text="₹15", style="success", callback_data="wallet_amt:15"),
                 styled_inline_btn(text="₹50", style="success", callback_data="wallet_amt:50"),
             ],
@@ -2711,6 +2994,13 @@ def format_admin_order_lookup_report(order: dict[str, Any]) -> str:
     qty = int(order.get("quantity", 1))
     unit_p = float(order.get("price", 0.0))
     total_p = float(order.get("total_price", unit_p * qty))
+    refunded_qty = int(order.get("refunded_qty", 0))
+    refunded_amt = float(order.get("refunded_amount", 0.0))
+    refund_line = (
+        f"• <b>Refunded:</b> {refunded_qty}/{qty} unit(s) (₹{refunded_amt:.2f})\n"
+        if refunded_qty > 0
+        else ""
+    )
 
     raw_ts = str(order.get("created_at", ""))
     try:
@@ -2721,7 +3011,7 @@ def format_admin_order_lookup_report(order: dict[str, Any]) -> str:
 
     codes = order.get("delivered_codes") or []
     if isinstance(codes, list) and codes:
-        codes_block = "\n".join(f"• <code>{html.escape(str(c))}</code>" for c in codes)
+        codes_block = format_delivered_codes_block(codes)
     else:
         codes_block = "• <i>No codes recorded</i>"
 
@@ -2741,8 +3031,9 @@ def format_admin_order_lookup_report(order: dict[str, Any]) -> str:
         f"• <b>Product / Item:</b> <b>{cname}</b>\n"
         f"• <b>Unit Price:</b> ₹{unit_p:g}\n"
         f"• <b>Quantity:</b> <b>{format_qty_expression(qty)}</b> ({qty})\n"
-        f"• <b>Total Paid:</b> <b>₹{total_p:.2f}</b>\n\n"
-        "<b>Delivered Coupon(s) / Link(s)</b>\n"
+        f"• <b>Total Paid:</b> <b>₹{total_p:.2f}</b>\n"
+        f"{refund_line}\n"
+        "<b>Delivered Coupon(s) / Link(s) / JSON</b>\n"
         f"{codes_block}"
     )
 
@@ -2759,7 +3050,7 @@ def format_admin_panel_overview() -> str:
         "",
         "Select an option below:",
         "• <b>➕ New Slot:</b> Create a standalone coupon slot or a Folder containing multiple sub-items.",
-        "• <b>⚡ Direct Add Coupon:</b> Append new coupons/links directly into an existing slot or folder item.",
+        "• <b>⚡ Direct Add Coupon:</b> Append new coupons/links/JSON directly into an existing slot or folder item.",
         "• <b>📥 Download Codes:</b> Withdraw &amp; download live codes/links as a <code>.txt</code> file (excluded from Leaderboard).",
         "• <b>💲 Change Price Per Unit:</b> Update unit price for any slot or folder item.",
         "• <b>🗑️ Delete Slots:</b> Delete a slot, folder item, or entire folder from Firebase.",
@@ -2924,9 +3215,7 @@ def format_payment_caption(
 
 
 def format_delivered_receipt(res: dict[str, Any]) -> str:
-    codes_block = "\n".join(
-        f"• <code>{html.escape(c)}</code>" for c in res["delivered_codes"]
-    )
+    codes_block = format_delivered_codes_block(res["delivered_codes"])
     utr_line = (
         f"• <b>UTR Number:</b> <code>{html.escape(res['utr'])}</code>\n"
         if res.get("utr")
@@ -2949,7 +3238,7 @@ def format_delivered_receipt(res: dict[str, Any]) -> str:
         f"• <b>Quantity:</b> <b>{format_qty_expression(int(res['quantity']))}</b>\n"
         f"• <b>Total Paid:</b> <b>₹{float(res['total_price']):.2f}</b>\n"
         f"{bal_line}\n"
-        "<b>Your Coupon Code(s) / Link(s)</b>\n"
+        "<b>Your Coupon Code(s) / Link(s) / JSON</b>\n"
         f"{codes_block}"
     )
 
@@ -3190,6 +3479,7 @@ def clear_all_pending_input_states(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_custom_qty_target", None)
     context.user_data.pop("awaiting_utr_txid", None)
     context.user_data.pop("awaiting_curl_upload", None)
+    context.user_data.pop("awaiting_promo_coupon", None)
     context.user_data.pop("admin_panel_state", None)
     context.user_data.pop("admin_cmd_state", None)
 
@@ -3405,7 +3695,7 @@ async def curl_command(
 async def admin_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Unlocked /admin command with Broadcast, User List, Check Order ID, Maintenance Mode + Cancel."""
+    """Unlocked /admin command with Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User + Cancel."""
     user = update.effective_user
     if not user or not update.message:
         return
@@ -4371,6 +4661,124 @@ async def handle_inline_callbacks(
             )
             return
 
+        if data == "adm_create_coupon":
+            clear_all_pending_input_states(context)
+            await query.answer()
+            context.user_data["admin_cmd_state"] = {
+                "mode": "create_coupon",
+                "step": "amount",
+            }
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        styled_inline_btn(
+                            text="❌ Cancel", style="danger", callback_data="adm_menu"
+                        )
+                    ]
+                ]
+            )
+            await query.edit_message_text(
+                text=(
+                    "🎟️ <b>Create Coupon for Bot</b>\n\n"
+                    "Enter the <b>Coupon Reward Amount (₹)</b> that each user will receive upon claiming (e.g., <code>10</code> or <code>25</code>):"
+                ),
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "adm_refund_user":
+            clear_all_pending_input_states(context)
+            await query.answer()
+            context.user_data["admin_cmd_state"] = {
+                "mode": "refund_user",
+                "step": "order_id",
+            }
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        styled_inline_btn(
+                            text="❌ Cancel", style="danger", callback_data="adm_menu"
+                        )
+                    ]
+                ]
+            )
+            await query.edit_message_text(
+                text=(
+                    "💸 <b>Refund User — Step 1</b>\n\n"
+                    "Please enter the <b>Order ID</b> (e.g., <code>ORD...</code>) to initiate a wallet refund:"
+                ),
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "adm_rfd_yes":
+            cmd_state = context.user_data.get("admin_cmd_state")
+            if (
+                not isinstance(cmd_state, dict)
+                or cmd_state.get("mode") != "refund_user"
+                or cmd_state.get("step") != "confirm"
+            ):
+                await query.answer("Refund session expired. Please start again.", show_alert=True)
+                return
+
+            order_id_val = str(cmd_state.get("order_id", ""))
+            refund_qty_val = int(cmd_state.get("refund_qty", 0))
+            context.user_data.pop("admin_cmd_state", None)
+
+            async with _INVENTORY_LOCK:
+                res = process_order_wallet_refund(order_id_val, refund_qty_val)
+
+            if not res.get("ok"):
+                await query.answer(str(res.get("reason", "Refund failed.")), show_alert=True)
+                await query.edit_message_text(
+                    text=f"❌ <b>Refund Failed</b>\n\n{html.escape(str(res.get('reason', 'Unable to process refund.')))}",
+                    reply_markup=build_admin_inbox_menu_keyboard(),
+                    parse_mode="HTML",
+                )
+                return
+
+            await query.answer("Refund initiated!")
+            target_uid = int(res["user_id"])
+            uname_str = format_username(res.get("username"))
+
+            await query.edit_message_text(
+                text=(
+                    "✅ <b>Wallet Refund Completed!</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"• <b>Refund ID:</b> <code>{html.escape(res['refund_id'])}</code>\n"
+                    f"• <b>Order ID:</b> <code>{html.escape(res['order_id'])}</code>\n"
+                    f"• <b>User ID:</b> <code>{target_uid}</code> ({uname_str})\n"
+                    f"• <b>Item:</b> <b>{html.escape(res['coupon_name'])}</b>\n"
+                    f"• <b>Refunded Quantity:</b> <b>{res['refund_qty']}/{res['total_order_qty']}</b>\n"
+                    f"• <b>Amount Credited to Wallet:</b> <b>₹{res['refund_amount']:.2f}</b>\n"
+                    f"• <b>User's New Available Balance:</b> <b>₹{res['new_available_balance']:.2f}</b>"
+                ),
+                reply_markup=build_admin_inbox_menu_keyboard(),
+                parse_mode="HTML",
+            )
+
+            try:
+                await context.bot.send_message(
+                    chat_id=target_uid,
+                    text=(
+                        "💸 <b>Order Refund Credited to Your Wallet!</b>\n"
+                        "━━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"• <b>Refund ID:</b> <code>{html.escape(res['refund_id'])}</code>\n"
+                        f"• <b>Order ID:</b> <code>{html.escape(res['order_id'])}</code>\n"
+                        f"• <b>Item:</b> <b>{html.escape(res['coupon_name'])}</b>\n"
+                        f"• <b>Refunded Quantity:</b> <b>{res['refund_qty']}</b>\n"
+                        f"• <b>Refund Amount Credited:</b> <b>₹{res['refund_amount']:.2f}</b>\n\n"
+                        f"• <b>Updated Available Balance:</b> <b>₹{res['new_available_balance']:.2f}</b>\n"
+                        f"• <b>Total Wallet Balance:</b> <b>₹{res['total_balance']:.2f}</b>"
+                    ),
+                    parse_mode="HTML",
+                )
+            except TelegramError as exc:
+                logger.warning("Failed to notify user %s of refund: %s", target_uid, exc)
+            return
+
     # /adminpanel callbacks (strictly ADMIN_ID only)
     if data.startswith("ap_"):
         if user.id != ADMIN_ID:
@@ -4635,7 +5043,7 @@ async def handle_inline_callbacks(
             await query.edit_message_text(
                 text=(
                     "⚡ <b>Direct Add Coupon</b>\n\n"
-                    "Select a slot or folder below to add coupons or links directly:"
+                    "Select a slot or folder below to add coupons, links, or JSON directly:"
                 ),
                 reply_markup=build_admin_direct_slots_keyboard(),
                 parse_mode="HTML",
@@ -4653,7 +5061,7 @@ async def handle_inline_callbacks(
             await query.edit_message_text(
                 text=(
                     f"📁 <b>Folder: {html.escape(str(folder_slot['name']))}</b>\n\n"
-                    "Select the sub-item inside this folder where you want to add coupons/links:"
+                    "Select the sub-item inside this folder where you want to add coupons/links/JSON:"
                 ),
                 reply_markup=build_admin_direct_subitems_keyboard(folder_slot),
                 parse_mode="HTML",
@@ -4688,9 +5096,9 @@ async def handle_inline_callbacks(
                 text=(
                     f"⚡ <b>Direct Add to: {html.escape(str(item['display_name']))}</b>\n"
                     f"• <b>Current Live Stock:</b> <b>{int(item['stock'])}</b>\n\n"
-                    "Send your coupon codes or links now:\n"
-                    "• Upload a <code>.txt</code> file, <b>OR</b>\n"
-                    "• Paste them directly line-by-line in chat (links &amp; codes are automatically extracted)."
+                    "Send your coupon codes, links, or JSON data now:\n"
+                    "• Upload a <code>.txt</code> / <code>.json</code> file, <b>OR</b>\n"
+                    "• Paste them directly line-by-line in chat (case-sensitive JSON, links &amp; codes are preserved)."
                 ),
                 reply_markup=kb,
                 parse_mode="HTML",
@@ -5003,6 +5411,39 @@ async def handle_inline_callbacks(
         except TelegramError:
             pass
         await show_wallet(update, context, from_callback=True)
+    elif data == "wallet_claim_coupon":
+        await query.answer()
+        clear_all_pending_input_states(context)
+        context.user_data["awaiting_promo_coupon"] = True
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    styled_inline_btn(
+                        text="🔙 Back to Wallet",
+                        style="danger",
+                        callback_data="open_wallet",
+                    )
+                ]
+            ]
+        )
+        prompt_text = (
+            "🎟️ <b>Claim Bot Coupon</b>\n\n"
+            "Please enter your <b>Coupon Code</b> below to redeem your instant wallet bonus:"
+        )
+        try:
+            await query.edit_message_text(
+                text=prompt_text,
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            if update.effective_chat:
+                await context.bot.send_message(
+                    chat_id=update.effective_chat.id,
+                    text=prompt_text,
+                    reply_markup=kb,
+                    parse_mode="HTML",
+                )
     elif data == "back_to_home":
         await query.answer()
         try:
@@ -5223,7 +5664,7 @@ async def send_withdrawn_codes_file(
 async def handle_admin_cmd_inputs(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Handles /admin Broadcast (any media/text/sticker/video/link) and Check Order ID."""
+    """Handles /admin Broadcast, Check Order ID, Create Coupon for Bot, and Refund User."""
     user = update.effective_user
     msg = update.message
     if not user or not msg or user.id != ADMIN_ID:
@@ -5328,6 +5769,197 @@ async def handle_admin_cmd_inputs(
             parse_mode="HTML",
         )
         return True
+
+    if mode == "create_coupon":
+        step = cmd_state.get("step")
+        if step == "amount":
+            if not msg.text:
+                await msg.reply_text(
+                    "❌ Please enter a valid numeric amount in INR (e.g., <code>10</code> or <code>25</code>):",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+            cleaned = msg.text.strip().replace("₹", "").replace(",", "").strip()
+            if not re.fullmatch(r"\d+(\.\d{1,2})?", cleaned):
+                await msg.reply_text(
+                    "❌ <b>Invalid Amount Format</b>\n\nPlease enter numbers only (e.g., <code>10</code> or <code>50</code>):",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+            amt = round(float(cleaned), 2)
+            if not math.isfinite(amt) or amt <= 0 or amt > MAX_WALLET_TOPUP:
+                await msg.reply_text(
+                    f"❌ Please enter a valid amount between <b>₹1</b> and <b>₹{MAX_WALLET_TOPUP:g}</b>:",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            cmd_state["amount"] = amt
+            cmd_state["step"] = "max_users"
+            await msg.reply_text(
+                f"✅ <b>Coupon Amount Saved:</b> <b>₹{amt:g}</b>\n\n"
+                "👥 <b>How many users can claim this coupon?</b>\n"
+                "Enter the maximum number of users (e.g., <code>10</code> or <code>20</code>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+
+        if step == "max_users":
+            if not msg.text or not re.fullmatch(r"\d+", msg.text.strip()):
+                await msg.reply_text(
+                    "❌ Please enter a valid whole number of users (e.g., <code>10</code> or <code>20</code>):",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+            max_users = int(msg.text.strip())
+            if max_users < 1 or max_users > 100000:
+                await msg.reply_text(
+                    "❌ User limit must be between <b>1</b> and <b>100000</b>. Please enter again:",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            coupon_amt = float(cmd_state["amount"])
+            async with _PROMO_LOCK:
+                created = create_bot_promo_coupon(coupon_amt, max_users)
+            context.user_data.pop("admin_cmd_state", None)
+
+            await msg.reply_text(
+                "✅ <b>Bot Wallet Coupon Created!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Coupon Code:</b> <code>{html.escape(created['code'])}</code>\n"
+                f"• <b>Wallet Credit Per User:</b> <b>₹{created['amount']:g}</b>\n"
+                f"• <b>Max Claim Limit:</b> <b>{created['max_users']}</b> user(s)\n\n"
+                "<i>Users can redeem this code from 💰 Wallet → 🎟️ Claim Coupon.</i>",
+                reply_markup=build_admin_inbox_menu_keyboard(),
+                parse_mode="HTML",
+            )
+            return True
+
+    if mode == "refund_user":
+        step = cmd_state.get("step")
+        if step == "order_id":
+            if not msg.text or not msg.text.strip():
+                await msg.reply_text(
+                    "❌ Please enter a valid <b>Order ID</b> (e.g., <code>ORD...</code>):",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            query_id = msg.text.strip()
+            order = lookup_order_by_id(query_id)
+            if not order:
+                await msg.reply_text(
+                    f"❌ <b>Order ID Not Found</b>\n\n"
+                    f"No order matching <code>{html.escape(query_id)}</code> exists in Firebase.\n"
+                    "Please enter a valid <b>Order ID</b> or tap <b>❌ Cancel</b>:",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            actual_oid = str(order.get("order_id", "")).strip()
+            total_qty = int(order.get("quantity", 1))
+            already_rfd = int(order.get("refunded_qty", 0))
+            refundable_qty = max(0, total_qty - already_rfd)
+            unit_price = float(order.get("price", 0.0))
+            target_uid = int(order.get("user_id", 0))
+            uname = format_username(order.get("username"))
+
+            if refundable_qty <= 0:
+                context.user_data.pop("admin_cmd_state", None)
+                await msg.reply_text(
+                    f"⚠️ <b>Order Already Fully Refunded</b>\n\n"
+                    f"• <b>Order ID:</b> <code>{html.escape(actual_oid)}</code>\n"
+                    f"• <b>Total Quantity:</b> {total_qty} (All {already_rfd} unit(s) already refunded).",
+                    reply_markup=build_admin_inbox_menu_keyboard(),
+                    parse_mode="HTML",
+                )
+                return True
+
+            cmd_state["order_id"] = actual_oid
+            cmd_state["refundable_qty"] = refundable_qty
+            cmd_state["unit_price"] = unit_price
+            cmd_state["user_id"] = target_uid
+            cmd_state["coupon_name"] = str(order.get("coupon_name", "Item"))
+            cmd_state["step"] = "qty"
+
+            await msg.reply_text(
+                "💸 <b>Refund User — Step 2</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Order ID:</b> <code>{html.escape(actual_oid)}</code>\n"
+                f"• <b>Customer:</b> <code>{target_uid}</code> ({uname})\n"
+                f"• <b>Product:</b> <b>{html.escape(str(order.get('coupon_name', 'Item')))}</b>\n"
+                f"• <b>Unit Price:</b> ₹{unit_price:g}\n"
+                f"• <b>Purchased Quantity:</b> {total_qty}\n"
+                f"• <b>Available to Refund:</b> <b>{refundable_qty}</b> unit(s)\n\n"
+                f"How many quantities do you want to refund? (Enter a number between <b>1</b> and <b>{refundable_qty}</b>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+
+        if step == "qty":
+            refundable_qty = int(cmd_state.get("refundable_qty", 1))
+            if not msg.text or not re.fullmatch(r"\d+", msg.text.strip()):
+                await msg.reply_text(
+                    f"❌ Please enter a valid whole number between <b>1</b> and <b>{refundable_qty}</b>:",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            req_qty = int(msg.text.strip())
+            if req_qty < 1 or req_qty > refundable_qty:
+                await msg.reply_text(
+                    f"❌ Quantity out of range. Please enter a number between <b>1</b> and <b>{refundable_qty}</b>:",
+                    reply_markup=cancel_kb,
+                    parse_mode="HTML",
+                )
+                return True
+
+            unit_price = float(cmd_state.get("unit_price", 0.0))
+            refund_amt = round(unit_price * req_qty, 2)
+            cmd_state["refund_qty"] = req_qty
+            cmd_state["step"] = "confirm"
+
+            confirm_kb = InlineKeyboardMarkup(
+                [
+                    [
+                        styled_inline_btn(
+                            text="✅ Yes, Refund Now",
+                            style="success",
+                            callback_data="adm_rfd_yes",
+                        ),
+                        styled_inline_btn(
+                            text="❌ No, Cancel",
+                            style="danger",
+                            callback_data="adm_menu",
+                        ),
+                    ]
+                ]
+            )
+
+            await msg.reply_text(
+                "⚠️ <b>Confirm Wallet Refund</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"• <b>Order ID:</b> <code>{html.escape(str(cmd_state['order_id']))}</code>\n"
+                f"• <b>Customer User ID:</b> <code>{cmd_state['user_id']}</code>\n"
+                f"• <b>Product:</b> <b>{html.escape(str(cmd_state['coupon_name']))}</b>\n"
+                f"• <b>Refund Quantity:</b> <b>{req_qty}</b> unit(s)\n"
+                f"• <b>Total Refund Amount:</b> <b>₹{refund_amt:.2f}</b>\n\n"
+                "Do you want to initiate this refund to the user's wallet?",
+                reply_markup=confirm_kb,
+                parse_mode="HTML",
+            )
+            return True
 
     return False
 
@@ -5522,10 +6154,10 @@ async def handle_admin_panel_inputs(
             ap_state["step"] = "codes"
             await msg.reply_text(
                 f"✅ <b>Unit Price Saved:</b> <b>₹{unit_price:g}</b>\n\n"
-                "🎟️ <b>Upload Coupons or Links:</b>\n"
-                "Send your coupon codes or links now:\n"
-                "• Upload a <code>.txt</code> file, <b>OR</b>\n"
-                "• Paste them directly in sequence (one per line). Both codes and URLs are automatically extracted and saved to Firebase.",
+                "🎟️ <b>Upload Coupons, Links, or JSON:</b>\n"
+                "Send your items now:\n"
+                "• Upload a <code>.txt</code> / <code>.json</code> file, <b>OR</b>\n"
+                "• Paste them directly in sequence (one per line). Case-sensitive JSON, codes, and URLs are preserved and saved to Firebase.",
                 reply_markup=cancel_kb,
                 parse_mode="HTML",
             )
@@ -5535,9 +6167,9 @@ async def handle_admin_panel_inputs(
             raw_content = ""
             if msg.document:
                 fname = (msg.document.file_name or "").lower()
-                if not fname.endswith(".txt"):
+                if not fname.endswith((".txt", ".json")):
                     await msg.reply_text(
-                        "❌ Please upload a valid <code>.txt</code> file or paste the coupons/links directly as text.",
+                        "❌ Please upload a valid <code>.txt</code> or <code>.json</code> file, or paste the items directly as text.",
                         reply_markup=cancel_kb,
                         parse_mode="HTML",
                     )
@@ -5549,7 +6181,7 @@ async def handle_admin_panel_inputs(
                 raw_content = msg.text
             else:
                 await msg.reply_text(
-                    "❌ Please send a <code>.txt</code> file or paste your coupons/links directly.",
+                    "❌ Please send a <code>.txt</code> / <code>.json</code> file or paste your items directly.",
                     reply_markup=cancel_kb,
                     parse_mode="HTML",
                 )
@@ -5558,7 +6190,7 @@ async def handle_admin_panel_inputs(
             parsed_items = parse_coupons_or_links(raw_content)
             if not parsed_items:
                 await msg.reply_text(
-                    "❌ No valid coupons or links found in your input. Please send non-empty lines or a valid <code>.txt</code> file:",
+                    "❌ No valid coupons, links, or JSON found in your input. Please send non-empty lines or a valid file:",
                     reply_markup=cancel_kb,
                     parse_mode="HTML",
                 )
@@ -5585,7 +6217,7 @@ async def handle_admin_panel_inputs(
                 f"{folder_line}"
                 f"• <b>Item Name:</b> <b>{html.escape(res['item_name'])}</b>\n"
                 f"• <b>Unit Price:</b> <b>₹{res['price']:g}</b>\n"
-                f"• <b>Coupons / Links Added:</b> <b>{res['added_count']}</b>\n"
+                f"• <b>Coupons / Links / JSON Added:</b> <b>{res['added_count']}</b>\n"
                 f"• <b>Duplicates Skipped:</b> {res['duplicate_count']}\n"
                 f"• <b>Current Live Stock:</b> <b>{res['total_stock']}</b>",
                 reply_markup=build_admin_post_add_keyboard(),
@@ -5599,9 +6231,9 @@ async def handle_admin_panel_inputs(
         raw_content = ""
         if msg.document:
             fname = (msg.document.file_name or "").lower()
-            if not fname.endswith(".txt"):
+            if not fname.endswith((".txt", ".json")):
                 await msg.reply_text(
-                    "❌ Please upload a valid <code>.txt</code> file or paste the coupons/links directly as text.",
+                    "❌ Please upload a valid <code>.txt</code> or <code>.json</code> file, or paste the items directly as text.",
                     reply_markup=cancel_kb,
                     parse_mode="HTML",
                 )
@@ -5613,7 +6245,7 @@ async def handle_admin_panel_inputs(
             raw_content = msg.text
         else:
             await msg.reply_text(
-                "❌ Please send a <code>.txt</code> file or paste your coupons/links directly.",
+                "❌ Please send a <code>.txt</code> / <code>.json</code> file or paste your items directly.",
                 reply_markup=cancel_kb,
                 parse_mode="HTML",
             )
@@ -5622,7 +6254,7 @@ async def handle_admin_panel_inputs(
         parsed_items = parse_coupons_or_links(raw_content)
         if not parsed_items:
             await msg.reply_text(
-                "❌ No valid coupons or links found in your input. Please send non-empty lines or a valid <code>.txt</code> file:",
+                "❌ No valid coupons, links, or JSON found in your input. Please send non-empty lines or a valid file:",
                 reply_markup=cancel_kb,
                 parse_mode="HTML",
             )
@@ -5641,7 +6273,7 @@ async def handle_admin_panel_inputs(
             return True
 
         await msg.reply_text(
-            "✅ <b>Coupons / Links Added to Live Firebase Stock!</b>\n\n"
+            "✅ <b>Coupons / Links / JSON Added to Live Firebase Stock!</b>\n\n"
             f"• <b>Item:</b> <b>{html.escape(res['display_name'])}</b>\n"
             f"• <b>Unit Price:</b> ₹{res['price']:g}\n"
             f"• <b>Newly Added:</b> <b>{res['added_count']}</b>\n"
@@ -5704,7 +6336,7 @@ async def handle_free_text_and_docs(
     if not user or not msg:
         return
 
-    # 1. /admin active wizard (Broadcast / Check Order ID)
+    # 1. /admin active wizard (Broadcast, Check Order ID, Create Coupon, Refund User)
     if user.id == ADMIN_ID and await handle_admin_cmd_inputs(update, context):
         return
 
@@ -5744,6 +6376,64 @@ async def handle_free_text_and_docs(
     # 4. Enforce force-join on all regular user interactions
     allowed = await enforce_force_join(update, context)
     if not allowed:
+        return
+
+    # 4.5 Context-aware Bot Promo Coupon Claim Input
+    if context.user_data.get("awaiting_promo_coupon"):
+        cancel_wallet_kb = InlineKeyboardMarkup(
+            [
+                [
+                    styled_inline_btn(
+                        text="🔙 Back to Wallet",
+                        style="danger",
+                        callback_data="open_wallet",
+                    )
+                ]
+            ]
+        )
+        if not msg.text or not msg.text.strip():
+            await msg.reply_text(
+                "❌ Please type a valid <b>Coupon Code</b> to claim:",
+                reply_markup=cancel_wallet_kb,
+                parse_mode="HTML",
+            )
+            return
+
+        raw_code = msg.text.strip()
+        if contains_url(raw_code):
+            await msg.reply_text(
+                "❌ Links are not valid coupon codes. Please enter your <b>Coupon Code</b>:",
+                reply_markup=cancel_wallet_kb,
+                parse_mode="HTML",
+            )
+            return
+
+        async with get_user_lock(user.id), _PROMO_LOCK:
+            claim_res = redeem_bot_promo_coupon(user.id, raw_code)
+
+        if not claim_res.get("ok"):
+            await msg.reply_text(
+                f"❌ <b>Coupon Claim Failed</b>\n\n"
+                f"{html.escape(str(claim_res.get('reason', 'Invalid coupon code.')))}\n\n"
+                "Please enter a valid coupon code or tap <b>🔙 Back to Wallet</b>:",
+                reply_markup=cancel_wallet_kb,
+                parse_mode="HTML",
+            )
+            return
+
+        context.user_data.pop("awaiting_promo_coupon", None)
+        await msg.reply_text(
+            "🎉 <b>Coupon Claimed Successfully!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"• <b>Coupon Code:</b> <code>{html.escape(claim_res['code'])}</code>\n"
+            f"• <b>Amount Added:</b> <b>₹{claim_res['amount']:.2f}</b>\n\n"
+            "<b>Updated Wallet Summary</b>\n"
+            f"• <b>Available Balance:</b> <b>₹{claim_res['new_available_balance']:.2f}</b>\n"
+            f"• <b>Referral Balance:</b> <b>₹{claim_res['referral_balance']:.2f}</b>\n"
+            f"• <b>Total Balance:</b> <b>₹{claim_res['total_balance']:.2f}</b>",
+            reply_markup=build_wallet_keyboard(),
+            parse_mode="HTML",
+        )
         return
 
     # 5. Context-aware Custom Coupon Quantity Input
@@ -5895,7 +6585,7 @@ async def run_bot() -> None:
         [
             BotCommand("start", "Start the bot"),
             BotCommand("curl", "Update BharatPe cURL / session token (Admin)"),
-            BotCommand("admin", "Broadcast, User List, Order Check & Maintenance (Admin)"),
+            BotCommand("admin", "Broadcast, User List, Order Check, Coupon & Refund (Admin)"),
             BotCommand("adminpanel", "Manage coupon slots, folders & stock (Admin)"),
         ]
     )
@@ -5915,7 +6605,8 @@ async def run_bot() -> None:
             handle_inline_callbacks,
             pattern=(
                 r"^(adm_menu|adm_broadcast|adm_users:\d+|adm_check_order|"
-                r"adm_maintenance|adm_maint_toggle|"
+                r"adm_maintenance|adm_maint_toggle|adm_create_coupon|"
+                r"adm_refund_user|adm_rfd_yes|"
                 r"ap_home|ap_new_slot|ap_folder_yes|ap_folder_no|ap_direct_add|ap_check_qty|"
                 r"ap_change_price|ap_prc_fld:[a-zA-Z0-9_]+|ap_prc_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_del_slots|ap_del_fld:[a-zA-Z0-9_]+|ap_del_ask:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
@@ -5929,7 +6620,7 @@ async def run_bot() -> None:
                 r"chk_upi:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*:\d+|"
                 r"chk_wlt:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*:\d+|"
                 r"chk_cnl:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*:\d+|"
-                r"open_refer|open_wallet|back_to_home|"
+                r"open_refer|open_wallet|wallet_claim_coupon|back_to_home|"
                 r"orders_page:\d+|wallet_amt:\d+(\.\d+)?|wallet_custom|"
                 r"pay_paid:[A-Z0-9]+|pay_cancel:[A-Z0-9]+|"
                 r"utr_recheck:[A-Z0-9]+|utr_resubmit:[A-Z0-9]+)$"
