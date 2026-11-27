@@ -18,7 +18,6 @@ import urllib.parse
 
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
-import httpx
 import qrcode
 from telegram import (
     BotCommand,
@@ -99,14 +98,8 @@ DEFAULT_FIREBASE_CRED_DICT: dict[str, Any] = {
 
 PORT = int(os.getenv("PORT", "8080"))
 
-UPI_ID = "BHARATPE.8R0I1G1N4X31943@fbpe"
+DEFAULT_UPI_ID = os.getenv("DEFAULT_UPI_ID", "merchant@upi")
 MERCHANT_NAME = "Merchant"
-
-DEFAULT_BHARATPE_CONFIG = {
-    "merchant_id": "62337062",
-    "token": "1474e270a4c5416e97c57fa146261588",
-    "token_alert_sent": False,
-}
 
 MAINTENANCE_MESSAGE = (
     "🙂 sʏsᴛᴇᴍ ᴜɴᴅᴇʀ ᴍᴀɪɴᴛᴇɴᴀɴᴄᴇ\n"
@@ -255,11 +248,9 @@ def _normalize_relaxed_json_quotes(raw_block: str) -> str:
         out.append(ch)
         i += 1
     normalized = "".join(out)
-    # Quote unquoted keys (e.g. mobile: ...)
     normalized = re.sub(r'([\{\[,]\s*)([a-zA-Z0-9_$-]+)\s*:', r'\1"\2":', normalized)
-    # Handle empty values left behind when Telegram strips `` (e.g. "name": , -> "name": "")
     normalized = re.sub(r':\s*(?=[,\}\]])', ': ""', normalized)
-    # Quote unquoted scalar string/UUID/JWT values (e.g. "token": a5140d68-...)
+
     def _quote_unquoted_val(m: re.Match[str]) -> str:
         prefix = m.group(1)
         val = m.group(2).strip()
@@ -275,22 +266,18 @@ def _normalize_relaxed_json_quotes(raw_block: str) -> str:
         _quote_unquoted_val,
         normalized,
     )
-    # Remove trailing commas before } or ]
     normalized = re.sub(r",\s*([\}\]])", r"\1", normalized)
     return normalized
 
 
 def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
-    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), curly quotes, or Telegram-stripped JSON.
-    Returns (is_valid, parsed_obj, is_strict_json).
-    """
+    """Parses ANY app's JSON/dict/list: standard (\"), single-quoted ('), backtick (`), curly quotes, or Telegram-stripped JSON."""
     s = raw_block.strip()
     if len(s) < 2:
         return False, None, False
     if not ((s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]"))):
         return False, None, False
 
-    # 1. Standard strict JSON
     try:
         parsed = json.loads(s)
         if isinstance(parsed, (dict, list)):
@@ -298,7 +285,6 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
     except (ValueError, TypeError):
         pass
 
-    # 2. Python dict/list literal (single-quoted strings, True/False/None)
     try:
         parsed_ast = ast.literal_eval(s)
         if isinstance(parsed_ast, (dict, list)):
@@ -306,7 +292,6 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
     except (ValueError, SyntaxError, TypeError):
         pass
 
-    # 3. Backtick-quoted (`key`: `val`), Smart-quoted, or Telegram-stripped JSON from any app
     try:
         norm_s = _normalize_relaxed_json_quotes(s)
         parsed_norm = json.loads(norm_s)
@@ -315,7 +300,6 @@ def _parse_structured_object(raw_block: str) -> tuple[bool, Any, bool]:
     except (ValueError, TypeError):
         pass
 
-    # 4. Fallback: if it is a balanced { key: val } or [ ... ] block containing ":" (key-value structure)
     if s.startswith("{") and s.endswith("}") and ":" in s:
         return True, s, False
 
@@ -328,7 +312,6 @@ def is_valid_json_item(value: str) -> bool:
 
 
 def _format_structured_block(raw_block: str, parsed_obj: Any, is_strict_json: bool) -> str:
-    """Preserves original formatting for multi-line/custom-quoted blocks, or compact JSON for single-line."""
     s = raw_block.strip()
     if "\n" in s:
         return s
@@ -338,7 +321,6 @@ def _format_structured_block(raw_block: str, parsed_obj: Any, is_strict_json: bo
 
 
 def _extract_balanced_json_blocks(text: str) -> tuple[list[str], str]:
-    """Extracts single-line or multi-line JSON/dict objects & arrays for ANY app (supports \", ', `, “”, ‘’)."""
     extracted: list[str] = []
     remaining_chars: list[str] = []
     n = len(text)
@@ -412,14 +394,12 @@ def parse_coupons_or_links(raw_text: str) -> list[str]:
 
     stripped_all = raw_text.strip().lstrip("\ufeff")
 
-    # 1. Extract all balanced JSON / dict / array blocks first (works for any app's JSON)
     json_blocks, leftover_text = _extract_balanced_json_blocks(stripped_all)
     for jb in json_blocks:
         if jb and jb not in seen:
             seen.add(jb)
             cleaned_items.append(jb)
 
-    # 2. Parse any remaining non-JSON lines (coupon codes or URLs)
     for raw_line in leftover_text.splitlines():
         line = raw_line.strip()
         if not line or line in (",", ";"):
@@ -486,9 +466,9 @@ def init_firebase() -> None:
         cred = credentials.Certificate(cred_dict)
         firebase_admin.initialize_app(cred, {"databaseURL": FIREBASE_DB_URL})
 
-    cfg_ref = firebase_db.reference("config/bharatpe")
-    if cfg_ref.get() is None:
-        cfg_ref.set(DEFAULT_BHARATPE_CONFIG)
+    upi_ref = firebase_db.reference("config/upi_id")
+    if upi_ref.get() is None:
+        upi_ref.set(DEFAULT_UPI_ID)
 
     maint_ref = firebase_db.reference("config/maintenance_mode")
     if maint_ref.get() is None:
@@ -547,34 +527,36 @@ async def guard_maintenance_mode(
 
 
 # =====================================================================
-# BharatPe Config & Payment Verification Helpers (Stored in Firebase)
+# UPI Config & QR Generator (Stored in Firebase)
 # =====================================================================
 
 
-def load_bharatpe_config() -> dict[str, Any]:
-    data = fb_ref("config/bharatpe").get()
-    if not isinstance(data, dict):
-        fb_ref("config/bharatpe").set(DEFAULT_BHARATPE_CONFIG)
-        return DEFAULT_BHARATPE_CONFIG.copy()
-    for k, v in DEFAULT_BHARATPE_CONFIG.items():
-        data.setdefault(k, v)
-    return data
+def get_active_upi_id() -> str:
+    val = fb_ref("config/upi_id").get()
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    return DEFAULT_UPI_ID
 
 
-def save_bharatpe_config(cfg: dict[str, Any]) -> None:
-    fb_ref("config/bharatpe").update(cfg)
+def set_active_upi_id(new_upi_id: str) -> str:
+    clean = new_upi_id.strip()
+    fb_ref("config/upi_id").set(clean)
+    return clean
 
 
-def extract_token_from_curl(curl_text: str) -> str | None:
-    match = re.search(r"token:\s*([a-fA-F0-9]{20,})", curl_text, re.IGNORECASE)
-    if match:
-        return match.group(1).strip()
-    return None
+def is_valid_upi_id(raw: str) -> bool:
+    s = raw.strip()
+    if not s or contains_url(s) or any(ch.isspace() for ch in s):
+        return False
+    return bool(re.fullmatch(r"[a-zA-Z0-9._-]{2,100}@[a-zA-Z0-9.-]{2,50}", s))
 
 
-def generate_upi_qr(amount: float, order_note: str = "OrderPayment") -> tuple[io.BytesIO, str]:
+def generate_upi_qr(
+    amount: float, order_note: str = "OrderPayment", upi_id: str | None = None
+) -> tuple[io.BytesIO, str]:
+    active_upi = (upi_id or get_active_upi_id()).strip()
     params = {
-        "pa": UPI_ID,
+        "pa": active_upi,
         "pn": MERCHANT_NAME,
         "am": f"{amount:.2f}",
         "cu": "INR",
@@ -592,113 +574,6 @@ def generate_upi_qr(amount: float, order_note: str = "OrderPayment") -> tuple[io
     img.save(bio, "PNG")
     bio.seek(0)
     return bio, upi_url
-
-
-async def fetch_bharatpe_transactions(page_size: int = 15) -> tuple[int, list[dict[str, Any]]]:
-    cfg = load_bharatpe_config()
-    now_ms = int(time.time() * 1000)
-    start_ms = now_ms - (24 * 60 * 60 * 1000)
-
-    url = "https://payments-tesseract.bharatpe.in/api/v1/merchant/transactions"
-    params = {
-        "module": "PAYMENT_QR",
-        "merchantId": cfg["merchant_id"],
-        "sDate": start_ms,
-        "eDate": now_ms,
-        "pageSize": page_size,
-        "pageCount": 0,
-        "isFromOtDashboard": 1,
-    }
-    headers = {
-        "accept": "application/json, text/javascript, */*; q=0.01",
-        "origin": "https://enterprise.bharatpe.in",
-        "referer": "https://enterprise.bharatpe.in/",
-        "token": cfg["token"],
-        "user-agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
-        ),
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, params=params, headers=headers)
-    except httpx.HTTPError as exc:
-        logger.warning("BharatPe HTTP error: %s", exc)
-        return 503, []
-
-    if resp.status_code != 200:
-        return resp.status_code, []
-
-    data = resp.json()
-    txns = data.get("data", {}).get("transactions", [])
-    return 200, txns
-
-
-async def verify_bharatpe_payment(utr: str, expected_amount: float) -> dict[str, Any]:
-    status_code, transactions = await fetch_bharatpe_transactions(page_size=25)
-
-    if status_code in (401, 403):
-        return {"ok": False, "reason": "TOKEN_EXPIRED"}
-    if status_code != 200:
-        return {"ok": False, "reason": f"API_ERROR_{status_code}"}
-
-    target_utr = utr.strip()
-    for txn in transactions:
-        txn_utr = str(txn.get("bankReferenceNo") or "").strip()
-        txn_amount = float(txn.get("amount", 0))
-        txn_status = str(txn.get("status", "")).upper()
-        txn_type = str(txn.get("type", "")).upper()
-
-        if txn_utr == target_utr and txn_status == "SUCCESS" and txn_type == "PAYMENT_RECV":
-            if txn_amount + 1e-6 >= expected_amount:
-                return {
-                    "ok": True,
-                    "amount": txn_amount,
-                    "utr": txn_utr,
-                    "payer": txn.get("payerName", "User"),
-                }
-            return {
-                "ok": False,
-                "reason": "AMOUNT_MISMATCH",
-                "received_amount": txn_amount,
-            }
-
-    return {"ok": False, "reason": "NOT_FOUND"}
-
-
-def is_within_bharatpe_check_window() -> bool:
-    """Allows token check only between 06:00 and 24:00 IST (skips 00:00 to 06:00 IST)."""
-    now_ist = datetime.now(IST)
-    return 6 <= now_ist.hour < 24
-
-
-async def token_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_within_bharatpe_check_window():
-        return
-
-    cfg = load_bharatpe_config()
-    status_code, _ = await fetch_bharatpe_transactions(page_size=1)
-
-    if status_code in (401, 403):
-        if not cfg.get("token_alert_sent", False):
-            cfg["token_alert_sent"] = True
-            save_bharatpe_config(cfg)
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        "🚨 <b>BharatPe Token Expired!</b>\n\n"
-                        "Please update the session token before users make payments.\n"
-                        "Use /curl or send the browser <code>Copy as cURL</code> text / <code>.txt</code> file directly here."
-                    ),
-                    parse_mode="HTML",
-                )
-            except TelegramError as exc:
-                logger.warning("Failed to send token alert to admin: %s", exc)
-    elif status_code == 200 and cfg.get("token_alert_sent", False):
-        cfg["token_alert_sent"] = False
-        save_bharatpe_config(cfg)
 
 
 # =====================================================================
@@ -1586,6 +1461,7 @@ def create_payment_session(
     now_ts = int(time.time())
     expires_ts = now_ts + PAYMENT_SESSION_TTL_SECONDS
     txid = f"TXN{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(3).upper()}"
+    order_id = f"ORD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
 
     deps_ref = fb_ref("wallet_deposits")
     all_deps = deps_ref.get()
@@ -1607,6 +1483,7 @@ def create_payment_session(
 
     session_data = {
         "txid": txid,
+        "order_id": order_id,
         "user_id": user_id,
         "chat_id": chat_id,
         "qr_message_id": None,
@@ -1755,7 +1632,6 @@ def finalize_upi_coupon_purchase(
 ) -> dict[str, Any]:
     now_iso = datetime.now(timezone.utc).isoformat()
     clean_utr = utr.strip()
-    order_id = f"ORD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
 
     dref = fb_ref(f"wallet_deposits/{txid}")
     dep = dref.get()
@@ -1764,6 +1640,10 @@ def finalize_upi_coupon_purchase(
 
     if is_utr_already_used(clean_utr):
         return {"ok": False, "reason": "DUPLICATE_UTR"}
+
+    order_id = str(dep.get("order_id") or "").strip()
+    if not order_id:
+        order_id = f"ORD{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}{secrets.token_hex(2).upper()}"
 
     slot_id = str(dep.get("slot_id") or "")
     sub_id = str(dep.get("sub_id") or "")
@@ -1775,7 +1655,7 @@ def finalize_upi_coupon_purchase(
     fb_ref(f"used_utrs/{clean_utr}").set(
         {"txid": txid, "user_id": user_id, "amount": float(paid_amount), "verified_at": now_iso}
     )
-    dref.update({"status": "verified", "utr": clean_utr, "verified_at": now_iso})
+    dref.update({"status": "verified", "order_id": order_id, "utr": clean_utr, "verified_at": now_iso})
 
     item = fetch_sellable_item(slot_id, sub_id)
     delivered_codes = (
@@ -2242,8 +2122,64 @@ def restore_pending_expiry_jobs(job_queue: Any) -> None:
 
 
 # =====================================================================
-# Admin Notification Helpers (Logs sent directly to ADMIN_ID = 8053042225)
+# Admin Notification & Payment Approval Helpers (ADMIN_ID = 8053042225)
 # =====================================================================
+
+
+def build_utr_admin_approval_keyboard(txid: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                styled_inline_btn(
+                    text="✅ Accept",
+                    style="success",
+                    callback_data=f"utr_acc:{txid}",
+                ),
+                styled_inline_btn(
+                    text="❌ Reject",
+                    style="danger",
+                    callback_data=f"utr_rej:{txid}",
+                ),
+            ]
+        ]
+    )
+
+
+async def send_admin_utr_approval_request(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    txid: str,
+    order_id: str,
+    username: str | None,
+    user_id: int,
+    amount: float,
+    utr: str,
+    quantity: int,
+    purpose: str,
+) -> None:
+    safe_username = format_username(username)
+    order_id_display = html.escape(order_id) if purpose == "coupon" and order_id else "N/A (Wallet)"
+    qty_display = format_qty_expression(int(quantity)) if purpose == "coupon" else "N/A"
+
+    admin_text = (
+        "🧾 <b>NEW UTR VERIFICATION REQUEST</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"• <b>Transaction ID:</b> <code>{html.escape(txid)}</code>\n"
+        f"• <b>Order ID:</b> <code>{order_id_display}</code>\n"
+        f"• <b>Username:</b> {safe_username} (<code>{user_id}</code>)\n"
+        f"• <b>Amount:</b> <b>₹{float(amount):.2f}</b>\n"
+        f"• <b>UTR:</b> <code>{html.escape(utr)}</code>\n"
+        f"• <b>Quantity:</b> <b>{qty_display}</b>"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=admin_text,
+            reply_markup=build_utr_admin_approval_keyboard(txid),
+            parse_mode="HTML",
+        )
+    except TelegramError as exc:
+        logger.error("Failed to send UTR approval request to admin %s: %s", ADMIN_ID, exc)
 
 
 async def notify_admin_wallet_delivery(
@@ -2387,7 +2323,7 @@ def build_main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 
 def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
-    """Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User + Cancel button."""
+    """Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User, Change UPI ID + Cancel."""
     return InlineKeyboardMarkup(
         [
             [
@@ -2428,10 +2364,15 @@ def build_admin_inbox_menu_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 styled_inline_btn(
+                    text="💳 Change UPI ID",
+                    style="success",
+                    callback_data="adm_change_upi",
+                ),
+                styled_inline_btn(
                     text="❌ Cancel",
                     style="danger",
                     callback_data="back_to_home",
-                )
+                ),
             ],
         ]
     )
@@ -3499,7 +3440,9 @@ def format_payment_caption(
     amount: float,
     item_name: str | None = None,
     quantity: int | None = None,
+    upi_id: str | None = None,
 ) -> str:
+    active_upi = (upi_id or get_active_upi_id()).strip()
     if item_name and quantity is not None:
         qty_str = format_qty_expression(quantity)
         header = (
@@ -3508,23 +3451,23 @@ def format_payment_caption(
             f"• <b>Quantity:</b> <b>{qty_str}</b>\n"
             f"• <b>Total Amount:</b> <b>₹{amount:.2f}</b>\n"
             f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
-            f"• <b>UPI ID:</b> <code>{html.escape(UPI_ID)}</code>\n\n"
+            f"• <b>UPI ID:</b> <code>{html.escape(active_upi)}</code>\n\n"
         )
     else:
         header = (
             "💳 <b>Wallet Top-Up Payment</b>\n\n"
             f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
             f"• <b>Amount:</b> <b>₹{amount:.2f}</b>\n"
-            f"• <b>UPI ID:</b> <code>{html.escape(UPI_ID)}</code>\n\n"
+            f"• <b>UPI ID:</b> <code>{html.escape(active_upi)}</code>\n\n"
         )
 
     return (
         header
         + "Scan the QR code above or pay using the UPI ID below.\n"
-        "• Payment will be verified automatically via 12-digit UTR.\n"
+        "• Payment will be verified via 12-digit UTR.\n"
         "• <b>Verification timeout:</b> 5 minutes.\n"
         "• After paying the <b>exact amount</b>, tap <b>✅ I Have Paid</b>.\n"
-        "• Your order/wallet is credited immediately upon verification (or manual admin check if delayed).\n"
+        "• Your order/wallet is credited immediately upon verification.\n"
         f"• Need help? Contact {SUPPORT_BOT_URL}\n"
         "• <i>This payment session will automatically expire in 15 minutes.</i>"
     )
@@ -3794,7 +3737,6 @@ def clear_all_pending_input_states(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("awaiting_custom_amount", None)
     context.user_data.pop("awaiting_custom_qty_target", None)
     context.user_data.pop("awaiting_utr_txid", None)
-    context.user_data.pop("awaiting_curl_upload", None)
     context.user_data.pop("awaiting_promo_coupon", None)
     context.user_data.pop("admin_panel_state", None)
     context.user_data.pop("admin_cmd_state", None)
@@ -3951,7 +3893,7 @@ async def enforce_force_join(
 
 
 # =====================================================================
-# Commands (/start, /curl, /admin, /adminpanel, unknown commands)
+# Commands (/start, /admin, /adminpanel, unknown commands)
 # =====================================================================
 
 
@@ -3982,36 +3924,10 @@ async def start_command(
     )
 
 
-async def curl_command(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    user = update.effective_user
-    if not user or not update.message:
-        return
-
-    clear_all_pending_input_states(context)
-    if user.id != ADMIN_ID:
-        if await guard_maintenance_mode(update, context):
-            return
-        await update.message.reply_text(
-            "⛔ <b>Access Denied:</b> This command is restricted to the administrator only.",
-            parse_mode="HTML",
-        )
-        return
-
-    context.user_data["awaiting_curl_upload"] = True
-    await update.message.reply_text(
-        "🔑 <b>BharatPe Token / cURL Update</b>\n\n"
-        "Send your browser-copied <code>Copy as cURL</code> text or upload the <code>.txt</code> file directly now.\n"
-        "The bot will automatically extract the session token and verify the API connection.",
-        parse_mode="HTML",
-    )
-
-
 async def admin_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    """Unlocked /admin command with Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User + Cancel."""
+    """Unlocked /admin command with Broadcast, User List, Check Order ID, Maintenance Mode, Create Coupon for Bot, Refund User, Change UPI ID + Cancel."""
     user = update.effective_user
     if not user or not update.message:
         return
@@ -4026,8 +3942,9 @@ async def admin_command(
         )
         return
 
+    active_upi = html.escape(get_active_upi_id())
     await update.message.reply_text(
-        "🛡️ <b>Admin Controls</b>\n\nSelect an action below:",
+        f"🛡️ <b>Admin Controls</b>\n• <b>Active UPI ID:</b> <code>{active_upi}</code>\n\nSelect an action below:",
         reply_markup=build_admin_inbox_menu_keyboard(),
         parse_mode="HTML",
     )
@@ -4073,47 +3990,6 @@ async def unknown_command_handler(
         reply_markup=build_main_menu_keyboard(),
         parse_mode="HTML",
     )
-
-
-async def apply_admin_curl_update(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, raw_content: str
-) -> None:
-    if not update.message:
-        return
-
-    new_token = extract_token_from_curl(raw_content)
-    if not new_token:
-        await update.message.reply_text(
-            "❌ <b>Invalid cURL Format</b>\n\n"
-            "Could not find a valid <code>token: &lt;hex_token&gt;</code> header in your input.\n"
-            "Please paste the full <b>Copy as cURL</b> command or upload a valid <code>.txt</code> file.",
-            parse_mode="HTML",
-        )
-        return
-
-    cfg = load_bharatpe_config()
-    cfg["token"] = new_token
-    cfg["token_alert_sent"] = False
-    save_bharatpe_config(cfg)
-    context.user_data.pop("awaiting_curl_upload", None)
-
-    status_msg = await update.message.reply_text(
-        "🔍 <b>Verifying new BharatPe token...</b>", parse_mode="HTML"
-    )
-    status_code, _ = await fetch_bharatpe_transactions(page_size=1)
-    if status_code == 200:
-        await status_msg.edit_text(
-            f"✅ <b>BharatPe Token Updated &amp; Verified!</b>\n\n"
-            f"• <b>Token:</b> <code>{html.escape(new_token)}</code>\n"
-            f"• <b>API Status:</b> Active (200 OK)",
-            parse_mode="HTML",
-        )
-    else:
-        await status_msg.edit_text(
-            f"⚠️ <b>Token Saved, But API Check Failed</b> (HTTP <code>{status_code}</code>).\n"
-            "Please verify your BharatPe dashboard login and send a fresh cURL.",
-            parse_mode="HTML",
-        )
 
 
 # =====================================================================
@@ -4350,12 +4226,14 @@ async def start_upi_payment_session(
             cancel_expiry_job(context, old_txid)
 
         txid = session["txid"]
-        qr_bio, _ = generate_upi_qr(amount, order_note=txid)
+        active_upi = get_active_upi_id()
+        qr_bio, _ = generate_upi_qr(amount, order_note=txid, upi_id=active_upi)
         caption = format_payment_caption(
             txid=txid,
             amount=amount,
             item_name=str(item["display_name"]) if item else None,
             quantity=quantity if item else None,
+            upi_id=active_upi,
         )
         keyboard = build_payment_session_keyboard(txid)
 
@@ -4396,6 +4274,15 @@ async def run_utr_verification_flow(
                 await status_message_to_edit.edit_text(err, parse_mode="HTML")
             else:
                 await context.bot.send_message(chat_id=chat_id, text=err, parse_mode="HTML")
+            return
+
+        if deposit["status"] == "verified":
+            context.user_data.pop("awaiting_utr_txid", None)
+            done_text = "✅ <b>Payment Already Verified</b>\n\nThis transaction has already been approved."
+            if status_message_to_edit:
+                await status_message_to_edit.edit_text(done_text, parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=done_text, parse_mode="HTML")
             return
 
         if deposit["status"] == "expired" or int(time.time()) > int(deposit["expires_at"]):
@@ -4489,46 +4376,174 @@ async def run_utr_verification_flow(
                 parse_mode="HTML",
             )
 
-        result = await verify_bharatpe_payment(clean_utr, expected_amount)
+        context.user_data.pop("awaiting_utr_txid", None)
+        u_row = get_user_row(user_id) or {}
 
-        if result.get("ok"):
-            context.user_data.pop("awaiting_utr_txid", None)
+        await send_admin_utr_approval_request(
+            context=context,
+            txid=txid,
+            order_id=str(deposit.get("order_id") or ""),
+            username=u_row.get("username"),
+            user_id=user_id,
+            amount=expected_amount,
+            utr=clean_utr,
+            quantity=int(deposit.get("quantity") or 1),
+            purpose=str(deposit.get("purpose") or "wallet"),
+        )
+
+        retry_kb = build_utr_retry_keyboard(txid, attempts_left)
+        try:
+            await msg.edit_text(
+                f"⏳ <b>Verifying your payment...</b>\n\n"
+                f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
+                f"• <b>Submitted UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
+                f"• <b>Attempts Used:</b> {attempts_used}/{MAX_UTR_ATTEMPTS}\n\n"
+                "Your UTR has been sent for verification. Please wait or tap "
+                "<b>🔄 Refresh / Recheck</b>, or re-submit a corrected 12-digit UTR.",
+                reply_markup=retry_kb,
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+
+
+async def handle_admin_utr_decision_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    admin_user = update.effective_user
+    if not query or not admin_user:
+        return
+
+    if admin_user.id != ADMIN_ID:
+        await query.answer("Access Denied: Administrator only.", show_alert=True)
+        return
+
+    data = query.data or ""
+    if ":" not in data:
+        await query.answer("Invalid request.", show_alert=True)
+        return
+
+    action, txid = data.split(":", 1)
+    txid = txid.strip()
+
+    deposit = get_deposit_session(txid, None)
+    if not deposit:
+        await query.answer("Transaction session not found.", show_alert=True)
+        return
+
+    target_user_id = int(deposit.get("user_id") or 0)
+    target_chat_id = int(deposit.get("chat_id") or target_user_id)
+    clean_utr = str(deposit.get("utr") or "").strip()
+    expected_amount = float(deposit.get("amount") or 0.0)
+    order_id_val = str(deposit.get("order_id") or "").strip()
+    qty_val = int(deposit.get("quantity") or 1)
+    purpose_val = str(deposit.get("purpose") or "wallet")
+
+    if action == "utr_rej":
+        if str(deposit.get("status")) == "verified":
+            await query.answer("Already accepted & verified.", show_alert=True)
+            return
+        cancel_expiry_job(context, txid)
+        fb_ref(f"wallet_deposits/{txid}").update({"status": "rejected"})
+        await query.answer("Payment rejected.")
+        try:
+            await query.edit_message_text(
+                text=(
+                    f"{query.message.text_html if query.message and query.message.text_html else ''}\n\n"
+                    "❌ <b>Status: Rejected by Admin</b>"
+                ).strip(),
+                reply_markup=None,
+                parse_mode="HTML",
+            )
+        except TelegramError:
+            pass
+
+        if target_chat_id:
+            try:
+                await context.bot.send_message(
+                    chat_id=target_chat_id,
+                    text=(
+                        "❌ <b>Payment Rejected</b>\n\n"
+                        f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
+                        f"• <b>UTR:</b> <code>{html.escape(clean_utr or 'N/A')}</code>\n"
+                        f"• <b>Amount:</b> <b>₹{expected_amount:.2f}</b>\n\n"
+                        "Your payment verification was rejected. Please check your payment/UTR or contact support."
+                    ),
+                    parse_mode="HTML",
+                )
+            except TelegramError as exc:
+                logger.warning("Failed to notify user %s of UTR rejection: %s", target_user_id, exc)
+        return
+
+    if action == "utr_acc":
+        if str(deposit.get("status")) == "verified":
+            await query.answer("Already accepted & verified.", show_alert=True)
+            return
+
+        if not clean_utr or not re.fullmatch(r"\d{12}", clean_utr):
+            await query.answer("No valid 12-digit UTR found on this session.", show_alert=True)
+            return
+
+        async with get_user_lock(target_user_id):
+            fresh_dep = get_deposit_session(txid, None)
+            if not fresh_dep or str(fresh_dep.get("status")) == "verified":
+                await query.answer("Already processed.", show_alert=True)
+                return
+
             cancel_expiry_job(context, txid)
 
-            if deposit.get("purpose") == "coupon" and deposit.get("slot_id"):
+            if purpose_val == "coupon" and fresh_dep.get("slot_id"):
                 async with _INVENTORY_LOCK:
                     order_res = finalize_upi_coupon_purchase(
                         txid=txid,
-                        user_id=user_id,
+                        user_id=target_user_id,
                         utr=clean_utr,
                         paid_amount=expected_amount,
                     )
                 if not order_res.get("ok"):
-                    await msg.edit_text(
-                        "❌ <b>Order Could Not Be Processed</b>\n\nThis UTR or transaction has already been redeemed.",
+                    await query.answer("UTR already used or order already processed.", show_alert=True)
+                    return
+
+                await query.answer("Payment accepted & order delivered!")
+                try:
+                    await query.edit_message_text(
+                        text=(
+                            f"{query.message.text_html if query.message and query.message.text_html else ''}\n\n"
+                            "✅ <b>Status: Accepted &amp; Delivered</b>"
+                        ).strip(),
+                        reply_markup=None,
                         parse_mode="HTML",
                     )
-                    return
+                except TelegramError:
+                    pass
 
                 if order_res.get("fallback_credited"):
                     new_avail = order_res["new_available_balance"]
                     ref_bal = order_res["referral_balance"]
-                    await msg.edit_text(
-                        f"⚠️ <b>Item Sold Out During Payment — Wallet Credited Instead!</b>\n\n"
-                        f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
-                        f"• <b>UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
-                        f"• <b>Credited to Available Balance:</b> <b>₹{expected_amount:.2f}</b>\n"
-                        f"• <b>Total Wallet Balance:</b> <b>₹{new_avail + ref_bal:.2f}</b>",
-                        parse_mode="HTML",
-                    )
+                    if target_chat_id:
+                        try:
+                            await context.bot.send_message(
+                                chat_id=target_chat_id,
+                                text=(
+                                    f"⚠️ <b>Item Sold Out — Wallet Credited Instead!</b>\n\n"
+                                    f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
+                                    f"• <b>UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
+                                    f"• <b>Credited to Available Balance:</b> <b>₹{expected_amount:.2f}</b>\n"
+                                    f"• <b>Total Wallet Balance:</b> <b>₹{new_avail + ref_bal:.2f}</b>"
+                                ),
+                                parse_mode="HTML",
+                            )
+                        except TelegramError:
+                            pass
                     await notify_admin_wallet_delivery(
                         context=context,
-                        user_id=user_id,
+                        user_id=target_user_id,
                         first_name=order_res.get("first_name"),
                         username=order_res.get("username"),
                         txid=txid,
                         utr=clean_utr,
-                        payer_name=str(result.get("payer", "User")),
+                        payer_name="UPI User",
                         credited_amount=expected_amount,
                         previous_available=order_res["previous_available_balance"],
                         new_available=new_avail,
@@ -4536,14 +4551,20 @@ async def run_utr_verification_flow(
                     )
                     return
 
-                await msg.edit_text(
-                    format_delivered_receipt(order_res),
-                    parse_mode="HTML",
-                )
-                await send_order_attachment_if_multi(context.bot, chat_id, order_res)
+                if target_chat_id:
+                    try:
+                        await context.bot.send_message(
+                            chat_id=target_chat_id,
+                            text=format_delivered_receipt(order_res),
+                            parse_mode="HTML",
+                        )
+                    except TelegramError as exc:
+                        logger.warning("Failed to deliver order to %s: %s", target_chat_id, exc)
+                    await send_order_attachment_if_multi(context.bot, target_chat_id, order_res)
+
                 await notify_admin_coupon_order_delivery(
                     context=context,
-                    user_id=user_id,
+                    user_id=target_user_id,
                     first_name=order_res.get("first_name"),
                     username=order_res.get("username"),
                     order_id=order_res["order_id"],
@@ -4560,89 +4581,63 @@ async def run_utr_verification_flow(
 
             credit_res = finalize_wallet_deposit(
                 txid=txid,
-                user_id=user_id,
+                user_id=target_user_id,
                 utr=clean_utr,
                 credited_amount=expected_amount,
             )
             if not credit_res.get("ok"):
-                await msg.edit_text(
-                    "❌ <b>Payment Could Not Be Credited</b>\n\nThis UTR or transaction has already been processed.",
+                await query.answer("UTR already used or payment already credited.", show_alert=True)
+                return
+
+            await query.answer("Payment accepted & wallet credited!")
+            try:
+                await query.edit_message_text(
+                    text=(
+                        f"{query.message.text_html if query.message and query.message.text_html else ''}\n\n"
+                        "✅ <b>Status: Accepted &amp; Wallet Credited</b>"
+                    ).strip(),
+                    reply_markup=None,
                     parse_mode="HTML",
                 )
-                return
+            except TelegramError:
+                pass
 
             new_avail = credit_res["new_available_balance"]
             ref_bal = credit_res["referral_balance"]
             total_bal = new_avail + ref_bal
-            await msg.edit_text(
-                f"✅ <b>Payment Verified &amp; Wallet Credited!</b>\n\n"
-                f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
-                f"• <b>UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
-                f"• <b>Amount Added:</b> <b>₹{expected_amount:.2f}</b>\n\n"
-                f"<b>Updated Wallet Summary</b>\n"
-                f"• <b>Available Balance:</b> <b>₹{new_avail:.2f}</b>\n"
-                f"• <b>Referral Balance:</b> <b>₹{ref_bal:.2f}</b>\n"
-                f"• <b>Total Balance:</b> <b>₹{total_bal:.2f}</b>",
-                parse_mode="HTML",
-            )
+
+            if target_chat_id:
+                try:
+                    await context.bot.send_message(
+                        chat_id=target_chat_id,
+                        text=(
+                            f"✅ <b>Payment Verified &amp; Wallet Credited!</b>\n\n"
+                            f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
+                            f"• <b>UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
+                            f"• <b>Amount Added:</b> <b>₹{expected_amount:.2f}</b>\n\n"
+                            f"<b>Updated Wallet Summary</b>\n"
+                            f"• <b>Available Balance:</b> <b>₹{new_avail:.2f}</b>\n"
+                            f"• <b>Referral Balance:</b> <b>₹{ref_bal:.2f}</b>\n"
+                            f"• <b>Total Balance:</b> <b>₹{total_bal:.2f}</b>"
+                        ),
+                        parse_mode="HTML",
+                    )
+                except TelegramError as exc:
+                    logger.warning("Failed to notify user %s of wallet credit: %s", target_chat_id, exc)
 
             await notify_admin_wallet_delivery(
                 context=context,
-                user_id=user_id,
+                user_id=target_user_id,
                 first_name=credit_res.get("first_name"),
                 username=credit_res.get("username"),
                 txid=txid,
                 utr=clean_utr,
-                payer_name=str(result.get("payer", "User")),
+                payer_name="UPI User",
                 credited_amount=expected_amount,
                 previous_available=credit_res["previous_available_balance"],
                 new_available=new_avail,
                 referral_balance=ref_bal,
             )
-            return
-
-        context.user_data.pop("awaiting_utr_txid", None)
-        reason = result.get("reason", "NOT_FOUND")
-
-        if reason == "TOKEN_EXPIRED":
-            detail = (
-                "Payment gateway session is currently under maintenance. "
-                "The administrator has been notified — please tap <b>Refresh / Recheck</b> shortly."
-            )
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=(
-                        f"🚨 <b>Urgent Alert:</b> User <code>{user_id}</code> tried verifying UTR "
-                        f"<code>{html.escape(clean_utr)}</code> (₹{expected_amount:.2f}), "
-                        "but the BharatPe token is expired! Send /curl with a fresh cURL right away."
-                    ),
-                    parse_mode="HTML",
-                )
-            except TelegramError:
-                pass
-        elif reason == "AMOUNT_MISMATCH":
-            rec_amt = result.get("received_amount", 0.0)
-            detail = (
-                f"Received amount (<b>₹{rec_amt:.2f}</b>) is less than the required order amount "
-                f"(<b>₹{expected_amount:.2f}</b>). Please check your UTR or contact support."
-            )
-        else:
-            detail = (
-                "Payment was not found yet for this UTR. If you just paid, wait 30–60 seconds "
-                "and tap <b>🔄 Refresh / Recheck</b>, or re-submit a corrected 12-digit UTR."
-            )
-
-        retry_kb = build_utr_retry_keyboard(txid, attempts_left)
-        await msg.edit_text(
-            f"⚠️ <b>Payment Not Verified Yet</b>\n\n"
-            f"• <b>TXID:</b> <code>{html.escape(txid)}</code>\n"
-            f"• <b>Submitted UTR:</b> <code>{html.escape(clean_utr)}</code>\n"
-            f"• <b>Attempts Used:</b> {attempts_used}/{MAX_UTR_ATTEMPTS}\n\n"
-            f"{detail}",
-            reply_markup=retry_kb,
-            parse_mode="HTML",
-        )
 
 
 # =====================================================================
@@ -4875,6 +4870,10 @@ async def handle_inline_callbacks(
 
     data = query.data or ""
 
+    if data.startswith(("utr_acc:", "utr_rej:")):
+        await handle_admin_utr_decision_callback(update, context)
+        return
+
     # /admin callbacks (strictly ADMIN_ID only)
     if data.startswith("adm_"):
         if user.id != ADMIN_ID:
@@ -4886,9 +4885,35 @@ async def handle_inline_callbacks(
         if data == "adm_menu":
             clear_all_pending_input_states(context)
             await query.answer()
+            active_upi = html.escape(get_active_upi_id())
             await query.edit_message_text(
-                text="🛡️ <b>Admin Controls</b>\n\nSelect an action below:",
+                text=f"🛡️ <b>Admin Controls</b>\n• <b>Active UPI ID:</b> <code>{active_upi}</code>\n\nSelect an action below:",
                 reply_markup=build_admin_inbox_menu_keyboard(),
+                parse_mode="HTML",
+            )
+            return
+
+        if data == "adm_change_upi":
+            clear_all_pending_input_states(context)
+            await query.answer()
+            context.user_data["admin_cmd_state"] = {"mode": "change_upi"}
+            kb = InlineKeyboardMarkup(
+                [
+                    [
+                        styled_inline_btn(
+                            text="❌ Cancel", style="danger", callback_data="adm_menu"
+                        )
+                    ]
+                ]
+            )
+            current_upi = html.escape(get_active_upi_id())
+            await query.edit_message_text(
+                text=(
+                    "💳 <b>Change UPI ID</b>\n\n"
+                    f"• <b>Current UPI ID:</b> <code>{current_upi}</code>\n\n"
+                    "Please enter the <b>new UPI ID</b> to set for QR payments (e.g., <code>yourname@upi</code>):"
+                ),
+                reply_markup=kb,
                 parse_mode="HTML",
             )
             return
@@ -5987,7 +6012,7 @@ async def send_withdrawn_codes_file(
 async def handle_admin_cmd_inputs(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> bool:
-    """Handles /admin Broadcast, Check Order ID, Create Coupon for Bot, and Refund User."""
+    """Handles /admin Broadcast, Check Order ID, Create Coupon for Bot, Refund User, and Change UPI ID."""
     user = update.effective_user
     msg = update.message
     if not user or not msg or user.id != ADMIN_ID:
@@ -6007,6 +6032,36 @@ async def handle_admin_cmd_inputs(
             ]
         ]
     )
+
+    if mode == "change_upi":
+        if not msg.text or not msg.text.strip():
+            await msg.reply_text(
+                "❌ Please enter a valid <b>UPI ID</b> (e.g., <code>yourname@upi</code>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+
+        candidate_upi = msg.text.strip()
+        if not is_valid_upi_id(candidate_upi):
+            await msg.reply_text(
+                "❌ <b>Invalid UPI ID Format</b>\n\n"
+                "Please enter a valid UPI ID containing <code>@</code> (e.g., <code>merchant@ybl</code> or <code>merchant@okicici</code>):",
+                reply_markup=cancel_kb,
+                parse_mode="HTML",
+            )
+            return True
+
+        saved_upi = set_active_upi_id(candidate_upi)
+        context.user_data.pop("admin_cmd_state", None)
+        await msg.reply_text(
+            "✅ <b>UPI ID Updated!</b>\n\n"
+            f"• <b>Active UPI ID:</b> <code>{html.escape(saved_upi)}</code>\n\n"
+            "All new UPI QR payment sessions will now use this UPI ID.",
+            reply_markup=build_admin_inbox_menu_keyboard(),
+            parse_mode="HTML",
+        )
+        return True
 
     if mode == "broadcast":
         context.user_data.pop("admin_cmd_state", None)
@@ -6669,7 +6724,7 @@ async def handle_free_text_and_docs(
     if not user or not msg:
         return
 
-    # 1. /admin active wizard (Broadcast, Check Order ID, Create Coupon, Refund User)
+    # 1. /admin active wizard (Broadcast, Check Order ID, Create Coupon, Refund User, Change UPI ID)
     if user.id == ADMIN_ID and await handle_admin_cmd_inputs(update, context):
         return
 
@@ -6677,41 +6732,15 @@ async def handle_free_text_and_docs(
     if user.id == ADMIN_ID and await handle_admin_panel_inputs(update, context):
         return
 
-    # 3. Admin cURL text or .txt upload
-    if user.id == ADMIN_ID:
-        if msg.document:
-            fname = (msg.document.file_name or "").lower()
-            if fname.endswith(".txt"):
-                tg_file = await context.bot.get_file(msg.document.file_id)
-                file_bytes = await tg_file.download_as_bytearray()
-                content = file_bytes.decode("utf-8", errors="ignore")
-                if context.user_data.get("awaiting_curl_upload") or (
-                    "bharatpe.in" in content.lower() or "token:" in content.lower()
-                ):
-                    await apply_admin_curl_update(update, context, content)
-                    return
-            elif context.user_data.get("awaiting_curl_upload"):
-                await msg.reply_text(
-                    "❌ <b>Invalid File Type</b>\n\nPlease upload a <code>.txt</code> file containing your cURL command, or paste the cURL text directly.",
-                    parse_mode="HTML",
-                )
-                return
-        elif msg.text and (
-            context.user_data.get("awaiting_curl_upload")
-            or ("bharatpe.in" in msg.text.lower() and "token:" in msg.text.lower())
-        ):
-            await apply_admin_curl_update(update, context, msg.text)
-            return
-
     if await guard_maintenance_mode(update, context):
         return
 
-    # 4. Enforce force-join on all regular user interactions
+    # 3. Enforce force-join on all regular user interactions
     allowed = await enforce_force_join(update, context)
     if not allowed:
         return
 
-    # 4.5 Context-aware Bot Promo Coupon Claim Input
+    # 3.5 Context-aware Bot Promo Coupon Claim Input
     if context.user_data.get("awaiting_promo_coupon"):
         cancel_wallet_kb = InlineKeyboardMarkup(
             [
@@ -6769,7 +6798,7 @@ async def handle_free_text_and_docs(
         )
         return
 
-    # 5. Context-aware Custom Coupon Quantity Input
+    # 4. Context-aware Custom Coupon Quantity Input
     qty_target = context.user_data.get("awaiting_custom_qty_target")
     if isinstance(qty_target, dict):
         sid = str(qty_target.get("slot_id", ""))
@@ -6814,7 +6843,7 @@ async def handle_free_text_and_docs(
         )
         return
 
-    # 6. Context-aware Custom Wallet Top-Up Amount Input
+    # 5. Context-aware Custom Wallet Top-Up Amount Input
     if context.user_data.get("awaiting_custom_amount"):
         if not msg.text:
             await msg.reply_text(
@@ -6854,7 +6883,7 @@ async def handle_free_text_and_docs(
         )
         return
 
-    # 7. Context-aware 12-Digit UTR Submission Input
+    # 6. Context-aware 12-Digit UTR Submission Input
     pending_txid = context.user_data.get("awaiting_utr_txid")
     if pending_txid:
         if not msg.text:
@@ -6873,7 +6902,7 @@ async def handle_free_text_and_docs(
         )
         return
 
-    # 8. Stray text / duplicate URL guard outside active prompts
+    # 7. Stray text / duplicate URL guard outside active prompts
     if msg.text and contains_url(msg.text):
         await msg.reply_text(
             "⛔ External links and duplicate URLs are not accepted here. Please use the menu buttons below.",
@@ -6894,7 +6923,7 @@ async def run_bot() -> None:
         raise RuntimeError("Please set BOT_TOKEN in environment variables or code.")
 
     init_firebase()
-    load_bharatpe_config()
+    get_active_upi_id()
     app = Application.builder().token(BOT_TOKEN).build()
 
     menu_texts = [
@@ -6917,14 +6946,12 @@ async def run_bot() -> None:
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Start the bot"),
-            BotCommand("curl", "Update BharatPe cURL / session token (Admin)"),
-            BotCommand("admin", "Broadcast, User List, Order Check, Coupon & Refund (Admin)"),
+            BotCommand("admin", "Broadcast, User List, Order Check, Coupon, Refund & UPI (Admin)"),
             BotCommand("adminpanel", "Manage coupon slots, folders & stock (Admin)"),
         ]
     )
 
     app.add_handler(CommandHandler("start", start_command, filters=private_only))
-    app.add_handler(CommandHandler("curl", curl_command, filters=private_only))
     app.add_handler(CommandHandler("admin", admin_command, filters=private_only))
     app.add_handler(CommandHandler("adminpanel", adminpanel_command, filters=private_only))
     app.add_handler(MessageHandler(private_only & filters.COMMAND, unknown_command_handler))
@@ -6937,9 +6964,10 @@ async def run_bot() -> None:
         CallbackQueryHandler(
             handle_inline_callbacks,
             pattern=(
-                r"^(adm_menu|adm_broadcast|adm_users:\d+|adm_check_order|"
+                r"^(utr_acc:[A-Z0-9]+|utr_rej:[A-Z0-9]+|"
+                r"adm_menu|adm_broadcast|adm_users:\d+|adm_check_order|"
                 r"adm_maintenance|adm_maint_toggle|adm_create_coupon|"
-                r"adm_refund_user|adm_rfd_yes|"
+                r"adm_refund_user|adm_rfd_yes|adm_change_upi|"
                 r"ap_home|ap_new_slot|ap_folder_yes|ap_folder_no|ap_direct_add|ap_check_qty|"
                 r"ap_change_price|ap_prc_fld:[a-zA-Z0-9_]+|ap_prc_itm:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
                 r"ap_del_slots|ap_del_fld:[a-zA-Z0-9_]+|ap_del_ask:[a-zA-Z0-9_]+:[a-zA-Z0-9_]*|"
@@ -6969,7 +6997,6 @@ async def run_bot() -> None:
     )
 
     if app.job_queue:
-        app.job_queue.run_repeating(token_health_check, interval=10800, first=15)
         restore_pending_expiry_jobs(app.job_queue)
 
     await app.initialize()
